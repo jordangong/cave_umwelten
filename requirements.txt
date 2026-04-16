@@ -1,0 +1,12 @@
+torch>=2.0
+torchvision
+timm==0.9.16
+transformers==4.46.3
+accelerate
+datasets
+faiss-gpu
+sentencepiece
+protobuf
+numpy
+matplotlib
+tqdm
