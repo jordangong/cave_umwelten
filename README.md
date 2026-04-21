@@ -1,4 +1,4 @@
-<h1 align="center">Back into Plato's Cave: Examining Cross-modal Representational Convergence at Scale</h1>
+<h1 align="center">Back into Plato’s Cave: Examining Cross-modal Representational Convergence at Scale</h1>
 
 <p align="center">
 <a href="https://akoepke.github.io/">A. Sophia Koepke</a>, <a href="https://scholar.google.com/citations?user=-4l5Il4AAAAJ">Daniil Zverev</a>, <a href="http://shiry.ttic.edu/">Shiry Ginosar</a>, <a href="https://www2.eecs.berkeley.edu/Faculty/Homepages/efros.html">Alexei A. Efros</a>
@@ -110,6 +110,7 @@ If you find this code useful, please cite:
 @article{koepke2026cave,
   title={Back into Plato's Cave: Examining Cross-modal Representational Convergence at Scale},
   author={Koepke, A. Sophia and Zverev, Daniil and Ginosar, Shiry and Efros, Alexei A.},
+  journal={arXiv preprint arXiv:2604.18572},
   year={2026}
 }
 ```
