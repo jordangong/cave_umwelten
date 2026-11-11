@@ -236,10 +236,31 @@ def load_tokenizer(model_name):
     return tok
 
 
+def _batch_padded_batches(lengths, token_budget):
+    """Length-sorted batches (longest first) whose padded size stays <= token_budget."""
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    batches, cur = [], []
+    for i in order:
+        if cur and (len(cur) + 1) * lengths[cur[0]] > token_budget:
+            batches.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 def extract_language(texts, model_name, batch_size, max_length, pool, layer_indices,
-                     max_gpu_memory=None):
+                     max_gpu_memory=None, padding="shard", token_budget=8192):
     """Match cave_final's extract_llm.py: tokenize the entire text set at once
-    with padding='longest', left-pad, avg-pool over attention mask, all layers."""
+    with padding='longest', left-pad, avg-pool over attention mask, all layers.
+
+    padding="batch" (ours, opt-in): length-sorted batches of <= token_budget
+    padded tokens, each left-padded only to its own longest text, outputs put
+    back in input order. Same truncation, pooling and dtype; with RoPE models
+    only numerics differ (positions shift with the pad count, attention does
+    not). Original captions average ~20 tokens, so this is ~25x cheaper than
+    padding every batch to the shard's longest (almost always 512)."""
     print(f"\nmodel:       \t{model_name}")
     print(f"num_samples: \t{len(texts)}")
     model = load_llm(model_name, max_gpu_memory)
@@ -247,24 +268,47 @@ def extract_language(texts, model_name, batch_size, max_length, pool, layer_indi
     tok = load_tokenizer(model_name)
     print(f"num_params:  \t{num_params:,}")
 
-    tokens = tok(
-        texts, padding="longest", truncation=True,
-        max_length=max_length, return_tensors="pt",
-    )
-    print(f"Token shape: {tokens['input_ids'].shape}")
-
     device = next(model.parameters()).device
     all_feats = []
 
-    for i in trange(0, len(texts), batch_size, desc=model_name):
-        tok_in = {
-            k: v[i:i + batch_size].to(device).long()
-            for k, v in tokens.items()
-        }
+    if padding == "batch":
+        enc = tok(texts, truncation=True, max_length=max_length)["input_ids"]
+        lengths = [len(x) for x in enc]
+        batches = _batch_padded_batches(lengths, token_budget)
+        print(f"batch padding: {len(batches)} batches, mean {sum(lengths) / len(lengths):.1f} tokens, "
+              f"max {max(lengths)}, budget {token_budget}")
+
+        def batch_iter():
+            for idx in batches:
+                yield idx, tok.pad({"input_ids": [enc[i] for i in idx]}, padding="longest",
+                                   return_tensors="pt")
+        mask_out = None
+    else:
+        tokens = tok(
+            texts, padding="longest", truncation=True,
+            max_length=max_length, return_tensors="pt",
+        )
+        print(f"Token shape: {tokens['input_ids'].shape}")
+
+        def batch_iter():
+            for i in range(0, len(texts), batch_size):
+                yield None, {k: v[i:i + batch_size] for k, v in tokens.items()}
+        mask_out = tokens["attention_mask"].cpu()
+
+    n_batches = len(batches) if padding == "batch" else (len(texts) + batch_size - 1) // batch_size
+    order = []
+    for idx, tok_b in tqdm(batch_iter(), total=n_batches, desc=model_name):
+        tok_in = {k: v.to(device).long() for k, v in tok_b.items()}
+        if idx is not None:
+            order.extend(idx)
         with torch.no_grad():
+            # batch mode: logits only for the last position (hidden states don't
+            # depend on them; Gemma's 256k-vocab fp32 logits would cost ~8 GB a batch)
+            extra = {"num_logits_to_keep": 1} if padding == "batch" else {}
             out = model(
                 input_ids=tok_in["input_ids"],
                 attention_mask=tok_in["attention_mask"],
+                **extra,
             )
             if pool == "avg":
                 feats = torch.stack(out["hidden_states"]).permute(1, 0, 2, 3)  # (B, L, T, D)
@@ -280,8 +324,12 @@ def extract_language(texts, model_name, batch_size, max_length, pool, layer_indi
             all_feats.append(feats.cpu())
 
     all_feats = torch.cat(all_feats, dim=0)
+    if order:
+        inv = torch.empty(len(order), dtype=torch.long)
+        inv[torch.tensor(order)] = torch.arange(len(order))
+        all_feats = all_feats[inv]
     print(f"Features shape: {all_feats.shape}")
-    return all_feats, num_params, tokens["attention_mask"].cpu()
+    return all_feats, num_params, mask_out
 
 
 # ------------------------------------------------------------------- pipeline
@@ -299,6 +347,11 @@ def main():
                    help="Default: 64 for vision, 4 for language (matches cave_final)")
     p.add_argument("--max_length", type=int, default=512)
     p.add_argument("--pool", choices=["avg", "last"], default="avg")
+    p.add_argument("--padding", choices=["shard", "batch"], default="shard",
+                   help="language: shard = pad every batch to the shard's longest text (upstream); "
+                        "batch = length-sorted batches padded to their own longest (ours)")
+    p.add_argument("--token_budget", type=int, default=8192,
+                   help="--padding batch: max padded tokens per batch")
     p.add_argument("--layer_indices", nargs="*", type=int, default=None)
     p.add_argument("--max_gpu_memory", default=None,
                    help='Cap LLM weights per GPU, e.g. "9GiB" (offload rest to CPU)')
@@ -367,12 +420,11 @@ def main():
         feats, num_params, mask = extract_language(
             rows, args.model, args.batch_size, args.max_length,
             args.pool, args.layer_indices, args.max_gpu_memory,
+            args.padding, args.token_budget,
         )
-        save_dict = {
-            "feats": feats,
-            "num_params": num_params,
-            "mask": mask,
-        }
+        save_dict = {"feats": feats, "num_params": num_params, "padding": args.padding}
+        if mask is not None:
+            save_dict["mask"] = mask
         if args.layer_indices is not None:
             save_dict["layer_indices"] = args.layer_indices
 

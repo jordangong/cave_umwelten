@@ -36,6 +36,9 @@ LANG_MODEL=${LANG_MODEL:-openlm-research/open_llama_3b}
 VIS_BS=${VIS_BS:-64}
 LANG_BS=${LANG_BS:-16}
 CAPTION=${CAPTION:-original}             # original | gemini (language features only)
+PADDING=${PADDING:-shard}                # shard (upstream) | batch (length-sorted, ~25x cheaper on original captions)
+TOKEN_BUDGET=${TOKEN_BUDGET:-8192}       # --padding batch: padded tokens per batch
+LAYERS=${LAYERS:-}                       # extract only these layer positions (space-separated); default all
 CAP_TAG=$([ "$CAPTION" = gemini ] && echo _gemini || true)
 
 FEAT=results/features
@@ -61,10 +64,12 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || tr
 extract() {  # extract <modality> <item>
   local mod=$1 item=$2 extra=()
   if [ "$mod" = vision ]; then
-    extra=(--batch_size "$VIS_BS" --num_workers "${SLURM_CPUS_PER_TASK:-8}")
+    extra=(--model "$VIS_MODEL" --batch_size "$VIS_BS" --num_workers "${SLURM_CPUS_PER_TASK:-8}")
   else
-    extra=(--batch_size "$LANG_BS" --caption "$CAPTION")
+    extra=(--model "$LANG_MODEL" --batch_size "$LANG_BS" --caption "$CAPTION"
+           --padding "$PADDING" --token_budget "$TOKEN_BUDGET")
   fi
+  [ -n "$LAYERS" ] && extra+=(--layer_indices $LAYERS)
   if [ "$item" -eq 0 ]; then
     $UV run python extract_features.py --modality "$mod" --config wit_1024 \
       --output_dir $FEAT/wit_1024 "${extra[@]}"
