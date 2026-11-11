@@ -62,6 +62,9 @@ def check_bfloat16_support():
 
 def _row_to_image(img_field):
     from PIL import Image
+    # WIT has scans of >100 MP; PIL warns past 89 MP and raises past 179 MP,
+    # which would kill a whole shard. These are trusted dataset images.
+    Image.MAX_IMAGE_PIXELS = None
     if isinstance(img_field, Image.Image):
         img = img_field
     elif isinstance(img_field, dict):
