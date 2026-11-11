@@ -121,7 +121,7 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--sizes", nargs="*", type=int, default=SIZES)
     p.add_argument("--layers", nargs="*", type=int, default=None,
-                   help="positions into the stored layer axis (default: all)")
+                   help="layer ids to use (default: every layer the shards store)")
     p.add_argument("--n_total", type=int, default=1_000_000, help="rows in the shard set (tests)")
     p.add_argument("--sample", type=int, default=SAMPLE, help="clamp-quantile sample size (tests)")
     args = p.parse_args()
@@ -136,6 +136,9 @@ def main():
     sizes_n = []
     for sf in shard_files:
         sizes_n.append(torch.load(sf, map_location="cpu", mmap=True)["feats"].shape[0])
+    first = torch.load(shard_files[0], map_location="cpu", mmap=True)
+    shard_ids = first.get("layer_indices") or list(range(first["feats"].shape[1]))
+    del first
     starts = np.cumsum([0] + sizes_n)
     assert starts[-1] == N_TOTAL, starts[-1]
 
@@ -151,18 +154,20 @@ def main():
     # ---- queries
     qd = torch.load(args.query_path, map_location="cpu")
     qfeats = qd["feats"]
-    layers = args.layers if args.layers is not None else list(range(qfeats.shape[1]))
-    stored_layer_ids = qd.get("layer_indices") or list(range(qfeats.shape[1]))
+    query_ids = qd.get("layer_indices") or list(range(qfeats.shape[1]))
+    layer_ids = args.layers if args.layers is not None else shard_ids
+    q_pos = [query_ids.index(i) for i in layer_ids]   # query layer axis may hold more layers
+    layers = [shard_ids.index(i) for i in layer_ids]  # positions in the shards' layer axis
     L = len(layers)
     nq = qfeats.shape[0]
     qn, q_query = [], []
-    for l in layers:
+    for l in q_pos:
         x = qfeats[:, l, :].float()
         qv = x.reshape(-1).abs().sort().values[int(Q * x.numel())].item()
         q_query.append(qv)
         qn.append(F.normalize(x.clamp(-qv, qv), dim=-1))
     qn = torch.stack(qn).to(dev)  # [L, nq, D]
-    print(f"queries {tuple(qfeats.shape)}, layers {layers}, {len(shard_files)} shards")
+    print(f"queries {tuple(qfeats.shape)}, layer ids {layer_ids}, {len(shard_files)} shards")
 
     # ---- pass 1: per-size, per-layer gallery clamp values
     samples = {n: quantile_sample(nested[n], sample_size=args.sample) for n in sizes}
@@ -182,7 +187,7 @@ def main():
     del qacc
     print(f"pass 1 (clamp values) done, {time.time() - t0:.0f}s")
     for n in sizes:
-        print(f"  n={n:>8,}  q[{layers[0]}]={q_gal[n][0]:.5f}  q[{layers[-1]}]={q_gal[n][-1]:.5f}")
+        print(f"  n={n:>8,}  q[{layer_ids[0]}]={q_gal[n][0]:.5f}  q[{layer_ids[-1]}]={q_gal[n][-1]:.5f}")
 
     # ---- pass 2: exact top-k against each gallery
     state = {n: TopK(L, kmax_for(n), nq, dev) for n in sizes}
@@ -219,7 +224,7 @@ def main():
         if si % 10 == 9 or si == len(shard_files) - 1:
             print(f"  shard {si + 1}/{len(shard_files)}  {time.time() - t0:.0f}s", flush=True)
 
-    out = {"sizes": [nq] + sizes, "knn": {}, "sim": {}, "layers": [stored_layer_ids[l] for l in layers],
+    out = {"sizes": [nq] + sizes, "knn": {}, "sim": {}, "layers": list(layer_ids),
            "q_query": q_query, "q_gallery": q_gal, "query_path": args.query_path,
            "shard_dir": args.shard_dir, "query_id0": QUERY_ID0}
     out["knn"][nq], out["sim"][nq] = q_only.finish()
