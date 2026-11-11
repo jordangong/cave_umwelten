@@ -12,11 +12,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def load_results(result_dir):
-    """Find all per-size result files and aggregate them."""
-    files = sorted(glob.glob(os.path.join(result_dir, "nested_wit1m*_size*.npy")))
+def load_results(result_dir, pattern="nested_wit1m_size*.npy"):
+    """Find all per-size result files and aggregate them. The default pattern
+    takes original-caption runs only; pass e.g. "nested_wit1m_gemini_size*.npy"
+    for Gemini captions (upstream's "nested_wit1m*_size*" mixed the two)."""
+    files = sorted(glob.glob(os.path.join(result_dir, pattern)))
     if not files:
-        raise FileNotFoundError(f"No nested_wit1m*_size*.npy files under {result_dir}")
+        raise FileNotFoundError(f"No {pattern} files under {result_dir}")
     rows = []
     for f in files:
         d = np.load(f, allow_pickle=True).item()
@@ -42,9 +44,11 @@ def main():
     p.add_argument("--result_dir", default="results/alignment/nested_wit1m")
     p.add_argument("--output", default="results/alignment/nested_wit1m/plot_nested_evolution.png")
     p.add_argument("--title", default="Nested WIT-1M: mutual kNN alignment")
+    p.add_argument("--pattern", default="nested_wit1m_size*.npy",
+                   help="glob for per-size result files inside --result_dir")
     args = p.parse_args()
 
-    rows = load_results(args.result_dir)
+    rows = load_results(args.result_dir, args.pattern)
     sizes = [r["size"] for r in rows]
 
     fig, ax = plt.subplots(1, 1, figsize=(7, 4.8))

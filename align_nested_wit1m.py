@@ -95,7 +95,7 @@ def _get_shard_info(shard_dir):
     if not shard_files:
         raise FileNotFoundError(f"No shard files found in {shard_dir}")
 
-    first = torch.load(shard_files[0], map_location="cpu")
+    first = torch.load(shard_files[0], map_location="cpu", mmap=True)
     num_layers = first["feats"].shape[1]
     feat_dim = first["feats"].shape[2]
     layer_indices = first.get("layer_indices", None)
@@ -104,7 +104,7 @@ def _get_shard_info(shard_dir):
     total_samples = 0
     shard_sizes = []
     for sf in shard_files:
-        data = torch.load(sf, map_location="cpu")
+        data = torch.load(sf, map_location="cpu", mmap=True)
         shard_sizes.append(data["feats"].shape[0])
         total_samples += data["feats"].shape[0]
         del data
@@ -146,7 +146,7 @@ def _compute_quantile(shard_dir, layer_idx, indices, q=0.95,
         if not mask.any():
             continue
         local_idx = sample_global[mask] - shard_start
-        data = torch.load(sf, map_location="cpu")
+        data = torch.load(sf, map_location="cpu", mmap=True)
         chunk = data["feats"][local_idx, local_layer_idx, :].float()
         samples.append(chunk)
         del data
@@ -177,7 +177,7 @@ def _build_faiss_index(shard_dir, layer_idx, q_val, indices):
         shard_start = cumulative[shard_idx]
         shard_end = cumulative[shard_idx + 1]
 
-        data = torch.load(sf, map_location="cpu")
+        data = torch.load(sf, map_location="cpu", mmap=True)
         chunk = data["feats"][:, local_layer_idx, :].float()
         del data
 

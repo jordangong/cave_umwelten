@@ -38,7 +38,9 @@ import io
 import os
 
 import torch
-from tqdm import trange
+from tqdm import tqdm, trange
+
+import paths
 
 DATASET_ID = "askoepke/wit_1m_recaptioned"
 DEFAULT_VISION_MODEL = "vit_base_patch14_dinov2.lvd142m"
@@ -71,9 +73,38 @@ def _row_to_image(img_field):
     return img
 
 
+def _load_rows_local(files, start, end, column):
+    """Rows [start, end) of `column` from a local parquet copy (files in HF
+    iteration order), reading only the files and the column that are needed."""
+    import pyarrow.parquet as pq
+    out, offset = [], 0
+    for f in files:
+        n = pq.ParquetFile(f).metadata.num_rows
+        lo, hi = max(start, offset), min(end, offset + n)
+        if lo < hi:
+            col = pq.read_table(f, columns=[column]).column(column)
+            out.extend(col.slice(lo - offset, hi - lo).to_pylist())
+        offset += n
+        if offset >= end:
+            break
+    if len(out) != end - start:
+        raise RuntimeError(f"wanted rows [{start}, {end}), got {len(out)} from {len(files)} files")
+    return out
+
+
 def load_rows(config, start, end, modality, caption):
-    """Load rows [start, end) from the HF dataset using streaming mode so a
-    small slice doesn't pull down entire parquet shards."""
+    """Load rows [start, end). Vision rows come back as raw image fields and are
+    decoded per batch in extract_vision (decoding a whole shard up front costs
+    tens of GB of RAM). Reads $PLATO_DATA_ROOT/askoepke--wit_1m_recaptioned if
+    present, else streams from the HF Hub so a small slice doesn't pull down
+    entire parquet shards."""
+    field = "image" if modality == "vision" else (
+        "gemini_caption" if caption == "gemini" else "original_caption")
+    files = paths.local_parquets(DATASET_ID, config)
+    if files is not None:
+        print(f"Reading {field} from {len(files)} local parquet files in {os.path.dirname(files[0])}")
+        return _load_rows_local(files, start, end, field)
+
     from datasets import load_dataset
     ds = load_dataset(
         DATASET_ID, config, split="train", streaming=True,
@@ -83,10 +114,6 @@ def load_rows(config, start, end, modality, caption):
     if start > 0:
         ds = ds.skip(start)
     ds = ds.take(end - start)
-
-    if modality == "vision":
-        return [_row_to_image(row["image"]) for row in ds]
-    field = "gemini_caption" if caption == "gemini" else "original_caption"
     return [row[field] for row in ds]
 
 
@@ -97,6 +124,10 @@ _KNOWN_LENGTHS = {"wit_1024": 1024, "wit_1m": 1_000_000}
 def get_dataset_length(config):
     if config in _KNOWN_LENGTHS:
         return _KNOWN_LENGTHS[config]
+    files = paths.local_parquets(DATASET_ID, config)
+    if files is not None:
+        import pyarrow.parquet as pq
+        return sum(pq.ParquetFile(f).metadata.num_rows for f in files)
     from datasets import load_dataset
     return len(load_dataset(
         DATASET_ID, config, split="train", cache_dir="data/wit1m/shards",
@@ -105,22 +136,42 @@ def get_dataset_length(config):
 
 # --------------------------------------------------------------------- vision
 
-def extract_vision(images, model_name, batch_size, layer_indices):
+class _ImageDataset(torch.utils.data.Dataset):
+    """Decode + transform one image at a time (in DataLoader workers)."""
+
+    def __init__(self, fields, transform):
+        self.fields, self.transform = fields, transform
+
+    def __len__(self):
+        return len(self.fields)
+
+    def __getitem__(self, i):
+        return self.transform(_row_to_image(self.fields[i]))
+
+
+def extract_vision(images, model_name, batch_size, layer_indices, num_workers=8):
     """Match cave_final's extract_dino.py exactly: `blocks.{i}.add_1`
-    hook points, CLS token, float32 output, all blocks by default."""
+    hook points, CLS token, float32 output, all blocks by default.
+    `images` are raw image fields (bytes or PIL); they are decoded and
+    transformed in DataLoader workers, in order."""
     import timm
     from timm.data import resolve_data_config, create_transform
     from torchvision.models.feature_extraction import create_feature_extractor
 
     print(f"\nmodel:       \t{model_name}")
     print(f"num_samples: \t{len(images)}")
-    vision_model = timm.create_model(model_name, pretrained=True).cuda().eval()
+    local = paths.resolve_timm(model_name)
+    overlay = dict(file=local) if local else None
+    vision_model = timm.create_model(
+        model_name, pretrained=True, pretrained_cfg_overlay=overlay,
+    ).cuda().eval()
     num_params = sum(p.numel() for p in vision_model.parameters())
     print(f"num_params:  \t{num_params:,}")
 
     transform = create_transform(
         **resolve_data_config(vision_model.pretrained_cfg, model=vision_model)
     )
+    print(transform)
 
     num_blocks = len(vision_model.blocks)
     block_ids = layer_indices if layer_indices is not None else list(range(num_blocks))
@@ -129,10 +180,13 @@ def extract_vision(images, model_name, batch_size, layer_indices):
     return_nodes = [f"blocks.{i}.add_1" for i in block_ids]
     vision_model = create_feature_extractor(vision_model, return_nodes=return_nodes)
 
+    loader = torch.utils.data.DataLoader(
+        _ImageDataset(images, transform), batch_size=batch_size,
+        shuffle=False, num_workers=num_workers, pin_memory=True,
+    )
     all_feats = []
-    for i in trange(0, len(images), batch_size, desc=model_name):
-        batch_end = min(i + batch_size, len(images))
-        xs = torch.stack([transform(images[j]) for j in range(i, batch_end)]).cuda()
+    for xs in tqdm(loader, desc=model_name):
+        xs = xs.cuda(non_blocking=True)
         with torch.no_grad():
             out = vision_model(xs)
             feats = [v[:, 0, :] for v in out.values()]   # CLS token
@@ -146,23 +200,31 @@ def extract_vision(images, model_name, batch_size, layer_indices):
 
 # ------------------------------------------------------------------- language
 
-def load_llm(model_name):
-    """Match cave_final's models.load_llm: bf16 where supported, fp32 fallback."""
+def load_llm(model_name, max_gpu_memory=None):
+    """Match cave_final's models.load_llm: bf16 where supported, fp32 fallback.
+    `max_gpu_memory` (e.g. "9GiB") caps the weights accelerate puts on each GPU
+    and offloads the rest to CPU; only needed on small pre-Ampere GPUs, where
+    the fp32 fallback doesn't fit."""
     from transformers import AutoModelForCausalLM
     dtype = torch.bfloat16 if check_bfloat16_support() else torch.float32
     print(f"torch_dtype:\t{dtype}")
+    kwargs = {}
+    if max_gpu_memory:
+        kwargs["max_memory"] = {i: max_gpu_memory for i in range(torch.cuda.device_count())}
+        kwargs["max_memory"]["cpu"] = "512GiB"
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        paths.resolve_llm(model_name),
         device_map="auto",
         torch_dtype=dtype,
         output_hidden_states=True,
+        **kwargs,
     ).eval()
     return model
 
 
 def load_tokenizer(model_name):
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model_name)
+    tok = AutoTokenizer.from_pretrained(paths.resolve_llm(model_name))
     if "huggyllama" in model_name:
         tok.pad_token = "[PAD]"
     elif tok.pad_token is None:
@@ -171,12 +233,13 @@ def load_tokenizer(model_name):
     return tok
 
 
-def extract_language(texts, model_name, batch_size, max_length, pool, layer_indices):
+def extract_language(texts, model_name, batch_size, max_length, pool, layer_indices,
+                     max_gpu_memory=None):
     """Match cave_final's extract_llm.py: tokenize the entire text set at once
     with padding='longest', left-pad, avg-pool over attention mask, all layers."""
     print(f"\nmodel:       \t{model_name}")
     print(f"num_samples: \t{len(texts)}")
-    model = load_llm(model_name)
+    model = load_llm(model_name, max_gpu_memory)
     num_params = sum(p.numel() for p in model.parameters())
     tok = load_tokenizer(model_name)
     print(f"num_params:  \t{num_params:,}")
@@ -234,6 +297,10 @@ def main():
     p.add_argument("--max_length", type=int, default=512)
     p.add_argument("--pool", choices=["avg", "last"], default="avg")
     p.add_argument("--layer_indices", nargs="*", type=int, default=None)
+    p.add_argument("--max_gpu_memory", default=None,
+                   help='Cap LLM weights per GPU, e.g. "9GiB" (offload rest to CPU)')
+    p.add_argument("--num_workers", type=int, default=8,
+                   help="DataLoader workers for image decoding (vision only)")
     # sharding (wit_1m)
     p.add_argument("--shard_id", type=int, default=None)
     p.add_argument("--num_shards", type=int, default=DEFAULT_NUM_SHARDS_WIT1M)
@@ -263,18 +330,18 @@ def main():
         end = min(end, start + args.limit)
         print(f"--limit {args.limit} active: using samples [{start}, {end})")
 
-    # Resolve save path
+    # Resolve save path. Gemini-caption language features get a "_gemini" tag
+    # so they don't overwrite the original-caption ones (upstream computed the
+    # tag but never used it).
     pool_tag = "pool-cls" if args.modality == "vision" else f"pool-{args.pool}"
     model_dir_name = _safe_name(args.model)
-    subset = args.config
-    if args.modality == "language" and args.caption == "gemini":
-        subset = f"{args.config}_gemini"
+    cap_tag = "_gemini" if (args.modality == "language" and args.caption == "gemini") else ""
 
     if args.config == "wit_1024" or args.shard_id is None:
-        save_path = os.path.join(args.output_dir, f"{model_dir_name}_{pool_tag}.pt")
+        save_path = os.path.join(args.output_dir, f"{model_dir_name}_{pool_tag}{cap_tag}.pt")
     else:
         save_path = os.path.join(
-            args.output_dir, model_dir_name, f"shard_{args.shard_id:04d}.pt"
+            args.output_dir, f"{model_dir_name}{cap_tag}", f"shard_{args.shard_id:04d}.pt"
         )
 
     if os.path.exists(save_path) and not args.force_remake:
@@ -288,7 +355,7 @@ def main():
     # Extract
     if args.modality == "vision":
         feats, num_params, block_ids = extract_vision(
-            rows, args.model, args.batch_size, args.layer_indices,
+            rows, args.model, args.batch_size, args.layer_indices, args.num_workers,
         )
         save_dict = {"feats": feats, "num_params": num_params}
         if args.layer_indices is not None:
@@ -296,7 +363,7 @@ def main():
     else:
         feats, num_params, mask = extract_language(
             rows, args.model, args.batch_size, args.max_length,
-            args.pool, args.layer_indices,
+            args.pool, args.layer_indices, args.max_gpu_memory,
         )
         save_dict = {
             "feats": feats,
