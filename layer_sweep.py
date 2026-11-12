@@ -22,6 +22,11 @@ per size and k:
 
     python layer_sweep.py --a results/knn/<vision>.pt --b results/knn/<language>.pt \
         --output results/alignment/layer_sweep/<vision>__<language>
+
+Scoring keeps, per query, A's rank of every id (a [queries, N] table). At
+LAION-15M (N = 15M, k = n/100 = 150K) that table is built per block of queries
+in int32 (int16 ranks stop at 32767); the counts are exact either way. With
+--perms 0 only raw scores are written (tau/cal are null).
 """
 import argparse
 import json
@@ -42,6 +47,14 @@ def gallery_members(n, nq, indices_dir):
     return np.load(os.path.join(indices_dir, f"gallery_indices_{n}.npy")).astype(np.int64)
 
 
+def _nan_to_none(x):
+    if isinstance(x, dict):
+        return {k: _nan_to_none(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_nan_to_none(v) for v in x]
+    return None if isinstance(x, float) and x != x else x
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--a", required=True, help="knn_sets output of model A (e.g. vision)")
@@ -52,6 +65,8 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gallery_indices_dir", default="data/wit1m/nested_wit1m_indices")
     p.add_argument("--sizes", nargs="*", type=int, default=None)
+    p.add_argument("--rank_bytes", type=float, default=2.2e9,
+                   help="GPU bytes for one block of the [queries, N] rank table")
     args = p.parse_args()
 
     dev = "cuda"
@@ -91,23 +106,31 @@ def main():
             invs.append(inv.to(dev))
             piqs.append(pq.to(dev))
 
-        grid = torch.zeros(La, Lb, len(ks))
-        null = torch.zeros(args.perms, La, Lb, len(ks))
-        ks_t = torch.tensor(ks, device=dev)
+        grid = torch.zeros(La, Lb, len(ks), dtype=torch.float64)
+        null = torch.zeros(args.perms, La, Lb, len(ks), dtype=torch.float64)
+        rdt = torch.int16 if kmax < 32767 else torch.int32
+        far = torch.iinfo(rdt).max
+        esz = torch.empty(0, dtype=rdt).element_size()
+        qb = max(1, min(nq, int(args.rank_bytes // (N * esz))))
+        arange_k = torch.arange(kmax, dtype=rdt, device=dev)
         for a in range(La):
-            rank = torch.full((nq, N), 32767, dtype=torch.int16, device=dev)
-            rank.scatter_(1, KA[a], torch.arange(kmax, dtype=torch.int16, device=dev).expand(nq, -1).contiguous())
+            for q0 in range(0, nq, qb):
+                q1 = min(nq, q0 + qb)
+                rank = torch.full((q1 - q0, N), far, dtype=rdt, device=dev)
+                rank.scatter_(1, KA[a, q0:q1], arange_k.expand(q1 - q0, -1).contiguous())
 
-            def score(kb):
-                r = rank.gather(1, kb)  # [nq, kmax]: rank in A of each B neighbour
-                return torch.stack([(r[:, :k] < k).sum(1).float().mean() / k for k in ks]).cpu()
+                def score(kb):  # summed hit fractions over this block's queries
+                    r = rank.gather(1, kb)  # [qb, kmax]: rank in A of each B neighbour
+                    return torch.stack([(r[:, :k] < k).sum().double() / k for k in ks]).cpu()
 
-            for b in range(Lb):
-                grid[a, b] = score(KB[b])
-                for pi in range(args.perms):
-                    kb = invs[pi][KB[b][piqs[pi]]].long()
-                    null[pi, a, b] = score(kb)
-            del rank
+                for b in range(Lb):
+                    grid[a, b] += score(KB[b, q0:q1])
+                    for pi in range(args.perms):
+                        kb = invs[pi][KB[b][piqs[pi][q0:q1]]].long()
+                        null[pi, a, b] += score(kb)
+                del rank
+        grid = (grid / nq).float()
+        null = (null / nq).float()
         npz[f"grid_{n}"] = grid.numpy()
         npz[f"null_{n}"] = null.numpy()
         npz[f"ks_{n}"] = np.array(ks)
@@ -126,15 +149,18 @@ def main():
         for j, k in enumerate(ks):
             best = int(flat[:, j].argmax())
             s = float(flat[best, j])
-            tau = float(torch.quantile(nflat[:, :, j].max(1).values, qtile))
             s10 = float(flat[best10, j])
-            tau10 = float(torch.quantile(nflat[torch.arange(args.perms), null_arg10, j], qtile))
+            if args.perms:
+                tau = float(torch.quantile(nflat[:, :, j].max(1).values, qtile))
+                tau10 = float(torch.quantile(nflat[torch.arange(args.perms), null_arg10, j], qtile))
+            else:
+                tau = tau10 = float("nan")
             rec["k"][str(k)] = {
                 "fixed": float(flat[fixed, j]),
                 "per_k": {"pair": [la_ids[best // Lb], lb_ids[best % Lb]], "raw": s, "tau": tau,
                           "cal": (s - tau) / (1 - tau)},
                 "at_k10": {"raw": s10, "tau": tau10, "cal": (s10 - tau10) / (1 - tau10)},
-                "null_mean": float(nflat[:, :, j].mean()),
+                "null_mean": float(nflat[:, :, j].mean()) if args.perms else float("nan"),
             }
         summary["sizes"][str(n)] = rec
         line = "  ".join(f"k={k}: fixed {rec['k'][str(k)]['fixed']:.4f} per-k {rec['k'][str(k)]['per_k']['raw']:.4f}"
@@ -145,8 +171,8 @@ def main():
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     np.savez_compressed(args.output + ".npz", layers_a=np.array(la_ids), layers_b=np.array(lb_ids), **npz)
-    with open(args.output + ".json", "w") as f:
-        json.dump(summary, f, indent=2)
+    with open(args.output + ".json", "w") as f:  # NaN (no perms) -> null
+        json.dump(_nan_to_none(summary), f, indent=2)
     print(f"saved {args.output}.npz/.json")
 
 

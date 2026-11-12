@@ -1,18 +1,22 @@
 """
-Extract DINO or OpenLLaMA features on WIT-1024 / WIT-1M from HuggingFace.
+Extract DINO or OpenLLaMA features on WIT-1024 / WIT-1M / LAION-15M.
 
 Features are saved at all transformer layers so that downstream alignment can
 choose any layer pair at runtime.
 
-Dataset: askoepke/wit_1m_recaptioned  (configs: wit_1024, wit_1m)
+Datasets (--config):
+  wit_1024, wit_1m   askoepke/wit_1m_recaptioned (local copy, else HF streaming)
+  laion_15m          jordangong/laion-15m (ours, built by build_laion15m.py; local
+                     only): 1500 parquet files x 10k rows, columns image/caption.
+                     Shard i of the features = parquet file i.
 
 Output format (matches the format consumed by align_nested_wit1m.py):
   {
     "feats": torch.float32 tensor of shape (N, num_layers, feat_dim),
     "num_params": int,
     "layer_indices": list[int]  (optional),
-    "shard_id": int             (only for sharded wit_1m),
-    "num_shards": int           (only for sharded wit_1m),
+    "shard_id": int             (only for sharded wit_1m / laion_15m),
+    "num_shards": int           (only for sharded wit_1m / laion_15m),
   }
 
 Vision tap points match cave_final: `blocks.{i}.add_1` (post-residual-add in
@@ -32,6 +36,10 @@ Usage:
     python extract_features.py --modality language --config wit_1m \
         --shard_id 0 --num_shards 100 \
         --output_dir results/features/wit_1m/shards
+
+    # DINO on LAION-15M shard 7 (= train-00007-of-01500.parquet)
+    python extract_features.py --modality vision --config laion_15m \
+        --shard_id 7 --output_dir results/features/laion_15m/shards
 """
 import argparse
 import io
@@ -43,6 +51,12 @@ from tqdm import tqdm, trange
 import paths
 
 DATASET_ID = "askoepke/wit_1m_recaptioned"
+# config -> (dataset id, original-caption column, rows, shards; None = row-sliced)
+CONFIGS = {
+    "wit_1024": (DATASET_ID, "original_caption", 1024, None),
+    "wit_1m": (DATASET_ID, "original_caption", 1_000_000, 100),
+    "laion_15m": ("jordangong/laion-15m", "caption", 15_000_000, 1500),
+}
 DEFAULT_VISION_MODEL = "vit_base_patch14_dinov2.lvd142m"
 DEFAULT_LANGUAGE_MODEL = "openlm-research/open_llama_3b"
 DEFAULT_NUM_SHARDS_WIT1M = 100
@@ -98,12 +112,17 @@ def _load_rows_local(files, start, end, column):
 def load_rows(config, start, end, modality, caption):
     """Load rows [start, end). Vision rows come back as raw image fields and are
     decoded per batch in extract_vision (decoding a whole shard up front costs
-    tens of GB of RAM). Reads $PLATO_DATA_ROOT/askoepke--wit_1m_recaptioned if
-    present, else streams from the HF Hub so a small slice doesn't pull down
-    entire parquet shards."""
+    tens of GB of RAM). Reads $PLATO_DATA_ROOT/<dataset id> if present, else
+    streams from the HF Hub so a small slice doesn't pull down entire parquet
+    shards."""
+    dataset_id, caption_field = CONFIGS[config][:2]
+    if caption == "gemini" and config == "laion_15m":
+        raise ValueError("laion_15m has no Gemini captions")
     field = "image" if modality == "vision" else (
-        "gemini_caption" if caption == "gemini" else "original_caption")
-    files = paths.local_parquets(DATASET_ID, config)
+        "gemini_caption" if caption == "gemini" else caption_field)
+    files = paths.local_parquets(dataset_id, config)
+    if files is None and config == "laion_15m":
+        raise FileNotFoundError(f"no local copy of {dataset_id}/{config} under {paths.data_root()}")
     if files is not None:
         print(f"Reading {field} from {len(files)} local parquet files in {os.path.dirname(files[0])}")
         return _load_rows_local(files, start, end, field)
@@ -120,8 +139,28 @@ def load_rows(config, start, end, modality, caption):
     return [row[field] for row in ds]
 
 
+def load_shard_file(config, shard_id, modality, limit=None):
+    """laion_15m: rows of parquet file `shard_id` (one file = one feature shard),
+    read without touching the other 1499 files' footers."""
+    import pyarrow.parquet as pq
+    dataset_id, caption_field, total, num_shards = CONFIGS[config]
+    files = paths.local_parquets(dataset_id, config)
+    if files is None or len(files) != num_shards:
+        raise FileNotFoundError(f"expected {num_shards} local parquet files of {dataset_id}/{config}, "
+                                f"found {0 if files is None else len(files)}")
+    f = files[shard_id]
+    field = "image" if modality == "vision" else caption_field
+    print(f"Reading {field} from {f}")
+    col = pq.read_table(f, columns=[field]).column(field)
+    if col.null_count:
+        raise ValueError(f"{col.null_count} null {field} values in {f}")
+    if limit is not None:
+        col = col.slice(0, limit)
+    return col.to_pylist()
+
+
 # Known lengths so we don't need to materialize the dataset just to count rows.
-_KNOWN_LENGTHS = {"wit_1024": 1024, "wit_1m": 1_000_000}
+_KNOWN_LENGTHS = {c: v[2] for c, v in CONFIGS.items()}
 
 
 def get_dataset_length(config):
@@ -149,7 +188,13 @@ class _ImageDataset(torch.utils.data.Dataset):
         return len(self.fields)
 
     def __getitem__(self, i):
-        return self.transform(_row_to_image(self.fields[i]))
+        try:
+            img = _row_to_image(self.fields[i])
+        except Exception as e:  # never hit on WIT; one bad web image must not kill a shard
+            from PIL import Image
+            print(f"WARNING: row {i} undecodable ({type(e).__name__}: {e}); using a black image", flush=True)
+            img = Image.new("RGB", (518, 518))
+        return self.transform(img)
 
 
 def extract_vision(images, model_name, batch_size, layer_indices, num_workers=8):
@@ -337,7 +382,7 @@ def extract_language(texts, model_name, batch_size, max_length, pool, layer_indi
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--modality", choices=["vision", "language"], required=True)
-    p.add_argument("--config", choices=["wit_1024", "wit_1m"], required=True)
+    p.add_argument("--config", choices=list(CONFIGS), required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--model", default=None,
                    help="Model name. Defaults: "
@@ -359,7 +404,8 @@ def main():
                    help="DataLoader workers for image decoding (vision only)")
     # sharding (wit_1m)
     p.add_argument("--shard_id", type=int, default=None)
-    p.add_argument("--num_shards", type=int, default=DEFAULT_NUM_SHARDS_WIT1M)
+    p.add_argument("--num_shards", type=int, default=None,
+                   help="default: 100 for wit_1m, 1500 for laion_15m (fixed: one parquet file per shard)")
     # testing
     p.add_argument("--limit", type=int, default=None,
                    help="Only process the first N rows (for quick tests).")
@@ -371,8 +417,16 @@ def main():
     if args.batch_size is None:
         args.batch_size = 64 if args.modality == "vision" else 4
 
+    if args.num_shards is None:
+        args.num_shards = CONFIGS[args.config][3] or DEFAULT_NUM_SHARDS_WIT1M
+    one_file_shards = args.config == "laion_15m"
+    if one_file_shards:
+        if args.shard_id is None or args.num_shards != CONFIGS[args.config][3]:
+            raise ValueError(f"{args.config} needs --shard_id, and --num_shards {CONFIGS[args.config][3]}")
+    sharded = args.config != "wit_1024" and args.shard_id is not None
+
     # Figure out row range
-    if args.config == "wit_1024" or args.shard_id is None:
+    if not sharded:
         total = get_dataset_length(args.config)
         start, end = 0, total
     else:
@@ -393,7 +447,7 @@ def main():
     model_dir_name = _safe_name(args.model)
     cap_tag = "_gemini" if (args.modality == "language" and args.caption == "gemini") else ""
 
-    if args.config == "wit_1024" or args.shard_id is None:
+    if not sharded:
         save_path = os.path.join(args.output_dir, f"{model_dir_name}_{pool_tag}{cap_tag}.pt")
     else:
         save_path = os.path.join(
@@ -405,8 +459,12 @@ def main():
         return
 
     # Load rows
-    print(f"Loading {args.modality} rows from {DATASET_ID}/{args.config} [{start}:{end})...")
-    rows = load_rows(args.config, start, end, args.modality, args.caption)
+    print(f"Loading {args.modality} rows from {CONFIGS[args.config][0]}/{args.config} [{start}:{end})...")
+    if one_file_shards:
+        rows = load_shard_file(args.config, args.shard_id, args.modality, args.limit)
+        assert len(rows) == end - start, (len(rows), start, end)
+    else:
+        rows = load_rows(args.config, start, end, args.modality, args.caption)
 
     # Extract
     if args.modality == "vision":
@@ -428,7 +486,7 @@ def main():
         if args.layer_indices is not None:
             save_dict["layer_indices"] = args.layer_indices
 
-    if args.shard_id is not None and args.config == "wit_1m":
+    if sharded:
         save_dict["shard_id"] = args.shard_id
         save_dict["num_shards"] = args.num_shards
 

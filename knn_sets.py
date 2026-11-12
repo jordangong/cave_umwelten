@@ -15,8 +15,20 @@ Features are prepared exactly as `align_nested_wit1m.py` prepares them:
   of that gallery (same RandomState(42 + 99999) draw as `_compute_quantile`;
   all rows when n <= 200K), then l2-normalise;
 - the queries are added to every gallery and each query's own row is dropped.
-Ids: gallery rows are their global position 0..999,999 in the WIT-1M shard set,
-query j is 1,000,000 + j. Exact search on GPU in fp32 (TF32 off).
+Ids: gallery rows are their global position 0..N-1 in the shard set (N = rows
+in all shards: 1,000,000 for WIT-1M), query j is N + j. Exact search on GPU in
+fp32 (TF32 off).
+
+Memory is bounded by one shard plus the top-k state (L x 1024 x kmax per size,
+~1.2 GB per layer at kmax = 150K), so the same code runs LAION-15M galleries
+(queries are still WIT-1024 and can't be in LAION, but they're added to the
+gallery the same way):
+
+    python knn_sets.py --query_path results/features/wit_1024/<model>_pool-*.pt \
+        --shard_dir results/features/laion_15m/shards/<model> \
+        --gallery_indices_dir $PLATO_DATA_ROOT/jordangong--laion-15m/nested_indices \
+        --sizes 10000 50000 100000 500000 1000000 5000000 10000000 15000000 \
+        --output results/knn/laion_15m/<model>.pt
 
     python knn_sets.py \
         --query_path results/features/wit_1024/openlm-research_open_llama_3b_pool-avg.pt \
@@ -94,19 +106,41 @@ def quantile_sample(indices, seed=SEED, sample_size=SAMPLE):
 # ----------------------------------------------------------------- top-k state
 
 class TopK:
-    def __init__(self, num_layers, kmax, n_query, device):
+    """Running top-kmax per layer. Columns are buffered until there are
+    max(kmax, merge_cols) of them, then merged with one topk: at kmax = 150K
+    (LAION-15M) a topk per 10k-row shard would dominate the run. The buffer
+    is at most the size of the state itself."""
+
+    def __init__(self, num_layers, kmax, n_query, device, merge_cols=0):
         self.k = kmax
         self.sim = torch.full((num_layers, n_query, kmax), float("-inf"), device=device)
         self.ids = torch.full((num_layers, n_query, kmax), -1, dtype=torch.int32, device=device)
+        self.cap = max(kmax, merge_cols)
+        self.buf = [([], []) for _ in range(num_layers)]
+        self.nbuf = [0] * num_layers
 
     def merge(self, l, sim, ids):  # sim [nq, m], ids [m] int32
-        s = torch.cat([self.sim[l], sim], dim=1)
-        i = torch.cat([self.ids[l], ids.unsqueeze(0).expand(sim.shape[0], -1)], dim=1)
+        self.buf[l][0].append(sim)
+        self.buf[l][1].append(ids)
+        self.nbuf[l] += sim.shape[1]
+        if self.nbuf[l] >= self.cap:
+            self._flush(l)
+
+    def _flush(self, l):
+        sims, idss = self.buf[l]
+        if not sims:
+            return
+        s = torch.cat([self.sim[l]] + sims, dim=1)
+        i = torch.cat([self.ids[l]] + [x.unsqueeze(0).expand(s.shape[0], -1) for x in idss], dim=1)
+        self.buf[l], self.nbuf[l] = ([], []), 0
         top = s.topk(self.k, dim=1, sorted=False)
+        del s
         self.sim[l] = top.values
         self.ids[l] = i.gather(1, top.indices)
 
     def finish(self):
+        for l in range(len(self.buf)):
+            self._flush(l)
         order = self.sim.argsort(dim=2, descending=True)
         return self.ids.gather(2, order).cpu(), self.sim.gather(2, order).cpu()
 
@@ -122,10 +156,13 @@ def main():
     p.add_argument("--sizes", nargs="*", type=int, default=SIZES)
     p.add_argument("--layers", nargs="*", type=int, default=None,
                    help="layer ids to use (default: every layer the shards store)")
-    p.add_argument("--n_total", type=int, default=1_000_000, help="rows in the shard set (tests)")
+    p.add_argument("--merge_cols", type=int, default=0,
+                   help="buffer gallery columns per size until max(kmax, this) before a top-k merge "
+                        "(same result; fewer large-k topk calls)")
+    p.add_argument("--n_total", type=int, default=None,
+                   help="rows in the shard set; default: the shards' total (checked if given)")
     p.add_argument("--sample", type=int, default=SAMPLE, help="clamp-quantile sample size (tests)")
     args = p.parse_args()
-    N_TOTAL = QUERY_ID0 = args.n_total
 
     torch.backends.cuda.matmul.allow_tf32 = False
     dev = "cuda"
@@ -140,7 +177,9 @@ def main():
     shard_ids = first.get("layer_indices") or list(range(first["feats"].shape[1]))
     del first
     starts = np.cumsum([0] + sizes_n)
-    assert starts[-1] == N_TOTAL, starts[-1]
+    N_TOTAL = QUERY_ID0 = int(starts[-1])
+    assert args.n_total is None or args.n_total == N_TOTAL, (args.n_total, N_TOTAL)
+    print(f"{len(shard_files)} shards, {N_TOTAL:,} gallery rows")
 
     sizes = sorted(args.sizes)
     nested = {n: np.load(os.path.join(args.gallery_indices_dir, f"gallery_indices_{n}.npy")) for n in sizes}
@@ -190,7 +229,7 @@ def main():
         print(f"  n={n:>8,}  q[{layer_ids[0]}]={q_gal[n][0]:.5f}  q[{layer_ids[-1]}]={q_gal[n][-1]:.5f}")
 
     # ---- pass 2: exact top-k against each gallery
-    state = {n: TopK(L, kmax_for(n), nq, dev) for n in sizes}
+    state = {n: TopK(L, kmax_for(n), nq, dev, args.merge_cols) for n in sizes}
     qids = torch.arange(nq, dtype=torch.int32, device=dev) + QUERY_ID0
     eye = torch.eye(nq, dtype=torch.bool, device=dev)
     q_only = TopK(L, kmax_for(nq), nq, dev)
@@ -220,6 +259,7 @@ def main():
                 x = gs[:, l].float().clamp_(-qv, qv)
                 x = F.normalize(x, dim=-1)
                 state[n].merge(l, qn[l] @ x.T, gids[sel_t])
+                del x
         del g
         if si % 10 == 9 or si == len(shard_files) - 1:
             print(f"  shard {si + 1}/{len(shard_files)}  {time.time() - t0:.0f}s", flush=True)

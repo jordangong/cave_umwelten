@@ -20,6 +20,12 @@ Usage:
         --gallery_dino_shard_dir ./results/features/wit_1m/shards/vit_base_patch14_dinov2.lvd142m \
         --gallery_llm_shard_dir  ./results/features/wit_1m/shards/openlm-research_open_llama_3b \
         --gallery_indices_dir ./data/wit1m/nested_wit1m_indices
+
+Other galleries (e.g. LAION-15M) only need their shard dirs, their
+gallery_indices dir, --sizes and --name. The Faiss index lives in RAM: one size
+costs n x (768 + 3200) x 4 bytes, ~16 GB per 1M rows (240 GB at 15M), and CPU
+search time grows with n, so beyond ~1M use knn_sets.py + layer_sweep.py (GPU,
+streaming, same feature preparation and identical neighbour sets).
 """
 
 import gc
@@ -385,12 +391,14 @@ if __name__ == "__main__":
                              "If not provided, generates random nested indices.")
     parser.add_argument("--sizes", nargs="*", type=int, default=None,
                         help="Gallery sizes to evaluate (default: 10K 50K 100K 500K 1M)")
+    parser.add_argument("--name", default="nested_wit1m",
+                        help="output file prefix (e.g. nested_laion15m)")
     args = parser.parse_args()
 
     sizes = args.sizes or NESTED_SIZES
 
     print("=" * 80)
-    print(f"Nested WIT-1M alignment: wit_1024 queries")
+    print(f"Nested alignment ({args.name}): wit_1024 queries")
     print(f"DINO layer {args.dino_layer}, LLM layer {args.llm_layer}, seed {args.seed}")
     print(f"Caption type: {args.caption_type}")
     print(f"Gallery sizes: {[f'{s:,}' for s in sizes]}")
@@ -456,7 +464,7 @@ if __name__ == "__main__":
         size_tag = "_all"
 
     save_name = (
-        f"nested_wit1m{caption_tag}{size_tag}"
+        f"{args.name}{caption_tag}{size_tag}"
         f"_dino-L{args.dino_layer}_{dino_model_name}"
         f"_llm-L{args.llm_layer}_{llm_model_name}.npy"
     )
