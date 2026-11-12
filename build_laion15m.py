@@ -457,7 +457,11 @@ def stage_pack(args):
         if all(os.path.exists(o) for o in outs):
             continue
         parts = sorted(glob.glob(wpath(args, "buckets", f"b{bi:03d}", "*.parquet")))
-        t = pa.concat_tables([pq.read_table(p) for p in parts]).sort_by("pos")
+        t = pa.concat_tables([pq.read_table(p) for p in parts])
+        # a bucket's images are ~15 GB: sorting concatenates the column, which
+        # overflows binary's 32-bit offsets, so sort as large_binary
+        t = t.set_column(t.schema.get_field_index("image"), "image",
+                         t.column("image").cast(pa.large_binary())).sort_by("pos")
         pos = t.column("pos").to_numpy()
         lo = bi * BUCKET_ROWS
         if not np.array_equal(pos, np.arange(lo, lo + len(outs) * SHARD_ROWS)):
@@ -468,7 +472,9 @@ def stage_pack(args):
         t = t.append_column("src_row", t.column("row")).select(SHARD_COLS)
         for j, o in enumerate(outs):
             if not os.path.exists(o):
-                write_atomic(t.slice(j * SHARD_ROWS, SHARD_ROWS), o, row_group_size=1000)
+                s = t.slice(j * SHARD_ROWS, SHARD_ROWS)
+                s = s.set_column(s.schema.get_field_index("image"), "image", s.column("image").cast(pa.binary()))
+                write_atomic(s, o, row_group_size=1000)
         print(f"bucket {bi}: shards {s0}..{s1 - 1}", flush=True)
 
 

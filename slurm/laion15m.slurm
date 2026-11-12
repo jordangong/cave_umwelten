@@ -8,13 +8,13 @@
 # sbatch line (size with `hpcmon fit --gpus 0` first). Run from ~/repos/plato/cave_umwelten:
 #
 #   STAGE=sample   sbatch -J l15-sample  -p gpu4090,gpu40901t --cpus-per-task=2  --mem=16G --time=0:30:00 slurm/laion15m.slurm
-#   STAGE=hash     sbatch -J l15-hash    -p <parts> --cpus-per-task=16 --mem=48G --time=4:00:00 --array=0-39 slurm/laion15m.slurm
+#   STAGE=hash     sbatch -J l15-hash    -p <parts> --cpus-per-task=24 --mem=48G --time=2:00:00 --array=0-15 slurm/laion15m.slurm
 #   STAGE=dedup    sbatch -J l15-dedup   -p <parts> --cpus-per-task=4  --mem=96G --time=4:00:00 slurm/laion15m.slurm
-#   STAGE=scatter  sbatch -J l15-scatter -p <parts> --cpus-per-task=2  --mem=16G --time=2:00:00 --array=0-39 slurm/laion15m.slurm
-#   STAGE=pack     sbatch -J l15-pack    -p <parts> --cpus-per-task=2  --mem=64G --time=2:00:00 --array=0-59 slurm/laion15m.slurm
+#   STAGE=scatter  sbatch -J l15-scatter -p <parts> --cpus-per-task=2  --mem=16G --time=2:00:00 --array=0-7  slurm/laion15m.slurm
+#   STAGE=pack     sbatch -J l15-pack    -p <parts> --cpus-per-task=2  --mem=96G --time=2:00:00 --array=0-14 slurm/laion15m.slurm
 #   STAGE=finalize sbatch -J l15-final   -p <parts> --cpus-per-task=1  --mem=8G  --time=0:30:00 slurm/laion15m.slurm
 #
-# Array stages split their items round-robin over the array (SLURM_ARRAY_TASK_COUNT), and
+# The QoS allows 16 submitted jobs per user (array elements count). Array stages split their items round-robin over the array (SLURM_ARRAY_TASK_COUNT), and
 # skip finished outputs, so resubmitting a timed-out array is safe.
 set -euo pipefail
 cd ~/repos/plato/cave_umwelten
