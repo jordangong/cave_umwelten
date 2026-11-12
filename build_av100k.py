@@ -34,15 +34,16 @@ $SLURM_ARRAY_TASK_ID / $SLURM_ARRAY_TASK_COUNT):
               (member offsets + json), and (task 0) CLAPv2 parquet metadata
               -> work/clap_index.parquet
     pool      dedup + caption choice + seeded order -> work/pool.parquet, stats
-    pack      (array) decode/resample the first CANDIDATES pool clips, in
-              chunks of CHUNK -> work/packed/cNNNN.parquet
+    pack      (array) decode/resample the first CANDIDATES pool clips:
+              Freesound in order-chunks, CLAPv2 grouped by source parquet
+              -> work/packed/{oNNNN,pNNNN}.parquet
     finalize  first 100k decoded clips -> laion_audio_100k/train-*.parquet,
               nested_indices/, stats.json
   pvd:
     index     (array) PE-Video train/test tars -> work/index/<split>-<tar>.parquet
     pool      -> work/pool.parquet, stats
     pack      (array) full PyAV decode of the first CANDIDATES clips (frame count)
-              -> work/probed/cNNNN.parquet
+              -> work/probed/oNNNN.parquet
     finalize  -> pvd_100k/manifest-*.parquet, nested_indices/, stats.json
 
 Layout under $PLATO_DATA_ROOT (default ~/datasets): sources
@@ -343,43 +344,41 @@ def _decode_audio(b):
 
 
 def _audio_pack_one(job):
-    chunk, rows, out = job
+    _name, rows, out = job
     if os.path.exists(out):
         return out, None
-    # CLAPv2 rows: read each source file's audio column once
-    by_file = collections.defaultdict(list)
+    # CLAPv2 rows: read each source file's audio column once, decode, drop it
+    groups = collections.defaultdict(list)
     for r in rows:
-        if r["row"] >= 0:
-            by_file[r["file"]].append(r)
-    clap_bytes = {}
-    for f, rs in by_file.items():
-        col = pq.read_table(os.path.join(root(), f), columns=["audio"]).column("audio")
+        groups[r["file"] if r["row"] >= 0 else None].append(r)
+    res = {}
+    for f, rs in groups.items():
+        col = pq.read_table(os.path.join(root(), f), columns=["audio"]).column("audio") if f else None
         for r in rs:
-            clap_bytes[r["order"]] = col[r["row"]].as_py()["bytes"]
+            err, audio, n, sr, ch, secs = "", b"", 0, 0, 0, 0.0
+            try:
+                b = col[r["row"]].as_py()["bytes"] if f else read_tar_bytes(r["file"], r["offset"], r["size"])
+                audio, n, sr, ch, secs = _decode_audio(b)
+                if n < AUDIO_MIN_S * AUDIO_SR:
+                    err = f"short ({n} samples)"
+            except Exception as e:  # recorded; the clip is skipped at finalize
+                err = f"{type(e).__name__}: {e}"[:300]
+            res[r["order"]] = (audio if not err else b"", n, sr, ch, float(secs), err)
+        del col
     out_rows = collections.defaultdict(list)
     for r in rows:
-        err, audio, n, sr, ch, secs = "", b"", 0, 0, 0, 0.0
-        try:
-            b = clap_bytes[r["order"]] if r["row"] >= 0 else read_tar_bytes(r["file"], r["offset"], r["size"])
-            audio, n, sr, ch, secs = _decode_audio(b)
-            if n < AUDIO_MIN_S * AUDIO_SR:
-                err = f"short ({n} samples)"
-        except Exception as e:  # recorded, the clip is skipped at finalize
-            err = f"{type(e).__name__}: {e}"[:300]
+        audio, n, sr, ch, secs, err = res[r["order"]]
         for k in ("order", "source", "source_key", "caption", "captions"):
             out_rows[k].append(r[k])
-        out_rows["audio"].append(audio if not err else b"")
-        out_rows["num_samples"].append(n)
-        out_rows["orig_sr"].append(sr)
-        out_rows["orig_channels"].append(ch)
-        out_rows["orig_seconds"].append(float(secs))
-        out_rows["error"].append(err)
+        for k, v in zip(("audio", "num_samples", "orig_sr", "orig_channels", "orig_seconds", "error"),
+                        (audio, n, sr, ch, secs, err)):
+            out_rows[k].append(v)
     write_atomic(pa.table(out_rows), out)
     return out, sum(1 for e in out_rows["error"] if e)
 
 
 def _video_pack_one(job):
-    chunk, rows, out = job
+    _name, rows, out = job
     if os.path.exists(out):
         return out, None
     import av
@@ -409,20 +408,42 @@ def _video_pack_one(job):
     return out, sum(1 for e in out_rows["error"] if e)
 
 
+def pack_units(args, cand):
+    """Work units of the first CANDIDATES pool rows: Freesound / PVD rows in
+    order-chunks of CHUNK (offset reads from the tars), CLAPv2 rows grouped by
+    source parquet (one row group per file, so each file is read once), files
+    packed into units of <= CHUNK rows."""
+    sub = "packed" if args.dataset == "laion_audio" else "probed"
+    units = []
+    offs = [r for r in cand if r.get("row", -1) < 0]
+    for c in range(0, len(offs), CHUNK):
+        units.append((f"o{c // CHUNK:04d}", offs[c:c + CHUNK]))
+    by_file = collections.defaultdict(list)
+    for r in cand:
+        if r.get("row", -1) >= 0:
+            by_file[r["file"]].append(r)
+    cur, cid = [], 0
+    for f in sorted(by_file):
+        if cur and len(cur) + len(by_file[f]) > CHUNK:
+            units.append((f"p{cid:04d}", cur))
+            cur, cid = [], cid + 1
+        cur = cur + by_file[f]
+    if cur:
+        units.append((f"p{cid:04d}", cur))
+    return [(name, rows, wpath(args, sub, f"{name}.parquet")) for name, rows in units]
+
+
 def stage_pack(args):
     pool = pq.read_table(wpath(args, "pool.parquet"))
-    n = min(CANDIDATES, pool.num_rows)
-    cand = pool.slice(0, n).to_pylist()
-    sub = "packed" if args.dataset == "laion_audio" else "probed"
-    jobs = [(c, cand[c * CHUNK:(c + 1) * CHUNK], wpath(args, sub, f"c{c:04d}.parquet"))
-            for c in range((n + CHUNK - 1) // CHUNK)]
+    cand = pool.slice(0, min(CANDIDATES, pool.num_rows)).to_pylist()
+    jobs = pack_units(args, cand)
     mine = [jobs[i] for i in my_items(len(jobs), args)]
     fn = _audio_pack_one if args.dataset == "laion_audio" else _video_pack_one
     t0 = time.time()
     procs = ncpu() if args.dataset == "laion_audio" else max(1, ncpu() // 2)  # PyAV decodes with 2 threads
     for out, nerr in run_pool(fn, mine, procs):
         print(f"  {os.path.basename(out)}: {'skipped (exists)' if nerr is None else f'{nerr} errors'}", flush=True)
-    print(f"pack: {len(mine)}/{len(jobs)} chunks, {time.time() - t0:.0f}s")
+    print(f"pack: {len(mine)}/{len(jobs)} units, {time.time() - t0:.0f}s")
 
 
 def nested_indices(args):
@@ -455,12 +476,12 @@ def finalize_common(args, done, extra_stats):
 
 
 def stage_finalize(args):
-    sub = "packed" if args.dataset == "laion_audio" else "probed"
-    files = sorted(glob.glob(wpath(args, sub, "c*.parquet")))
     pool = pq.read_table(wpath(args, "pool.parquet"))
-    nchunks = (min(CANDIDATES, pool.num_rows) + CHUNK - 1) // CHUNK
-    if len(files) != nchunks:
-        raise RuntimeError(f"{len(files)}/{nchunks} {sub} chunks")
+    units = pack_units(args, pool.slice(0, min(CANDIDATES, pool.num_rows)).to_pylist())
+    files = [out for _, _, out in units]
+    missing = [f for f in files if not os.path.exists(f)]
+    if missing:
+        raise RuntimeError(f"{len(missing)}/{len(files)} pack units missing, e.g. {missing[0]}")
     pool_stats = json.load(open(wpath(args, "pool_stats.json")))
     cfg_dir = os.path.join(out_root(args), CONFIG_NAME[args.dataset])
     nshards = FINAL // SHARD_ROWS
