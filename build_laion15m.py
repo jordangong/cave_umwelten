@@ -472,7 +472,9 @@ def stage_pack(args):
         t = t.append_column("src_row", t.column("row")).select(SHARD_COLS)
         for j, o in enumerate(outs):
             if not os.path.exists(o):
-                s = t.slice(j * SHARD_ROWS, SHARD_ROWS)
+                # take (not slice): a slice keeps large_binary's absolute 64-bit
+                # offsets, which don't fit binary past the first ~2 GB
+                s = t.take(pa.array(np.arange(j * SHARD_ROWS, (j + 1) * SHARD_ROWS)))
                 s = s.set_column(s.schema.get_field_index("image"), "image", s.column("image").cast(pa.binary()))
                 write_atomic(s, o, row_group_size=1000)
         print(f"bucket {bi}: shards {s0}..{s1 - 1}", flush=True)
