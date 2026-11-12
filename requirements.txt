@@ -18,3 +18,4 @@ av
 soundfile
 soxr
 easydict    # VideoMAEv2 remote code
+einops      # Dasheng remote code
