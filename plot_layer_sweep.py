@@ -7,9 +7,13 @@ Plots from layer_sweep.py summaries (results/alignment/layer_sweep/*.json).
             grey line is the fixed WIT-1024 pair (main-text protocol).
   pairs:    several pairs, fixed WIT-1024 pair (Fig. 4 / S1 / S5-S7 style),
             one panel per k in {1, 10, n/100}.
+  scaling:  one panel per pair, k=1 / 10 / n/100 of the fixed pair against
+            gallery size (Fig. 4 / Fig. 6a-b style; for text-audio/video the
+            fixed pair is chosen at the 1k query level).
 
     python plot_layer_sweep.py reselect results/alignment/layer_sweep/A__B.json -o out.png
     python plot_layer_sweep.py pairs results/alignment/layer_sweep/{A__B,C__D}.json -o out.png
+    python plot_layer_sweep.py scaling results/alignment/layer_sweep_{laion_audio,pvd}_100k/*.json -o out.png
 """
 import argparse
 import json
@@ -85,13 +89,40 @@ def plot_pairs(paths, out):
     print(f"saved {out}")
 
 
+def plot_scaling(paths, out):
+    fig, axes = plt.subplots(1, len(paths), figsize=(5.5 * len(paths), 4), squeeze=False)
+    for ax, path in zip(axes[0], paths):
+        rec = json.load(open(path))
+        fp = next(iter(rec["sizes"].values()))["fixed_pair"]
+        for name, kf in KEYS:
+            xs, ys = [], []
+            for n_str, r in sorted(rec["sizes"].items(), key=lambda t: int(t[0])):
+                n = int(n_str)
+                k = str(kf(n))
+                if k in r["k"] and not (name == "k=n/100" and n // 100 < 10):
+                    xs.append(n)
+                    ys.append(r["k"][k]["fixed"])
+            ax.plot(xs, ys, "o-", label=name)
+        ax.set_xscale("log")
+        ax.set_xlabel("gallery size")
+        ax.set_title(f"{short(rec['a'])} L{fp[0]} x {short(rec['b'])} L{fp[1]}", fontsize=10)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    axes[0][0].set_ylabel("mutual kNN (fixed pair)")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    print(f"saved {out}")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["reselect", "pairs"])
+    p.add_argument("mode", choices=["reselect", "pairs", "scaling"])
     p.add_argument("paths", nargs="+")
     p.add_argument("-o", "--output", required=True)
     args = p.parse_args()
     if args.mode == "reselect":
         plot_reselect(args.paths[0], args.output)
-    else:
+    elif args.mode == "pairs":
         plot_pairs(args.paths, args.output)
+    else:
+        plot_scaling(args.paths, args.output)
