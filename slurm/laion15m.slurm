@@ -13,13 +13,14 @@
 #   STAGE=scatter  sbatch -J l15-scatter -p <parts> --cpus-per-task=2  --mem=16G --time=2:00:00 --array=0-7  slurm/laion15m.slurm
 #   STAGE=pack     sbatch -J l15-pack    -p <parts> --cpus-per-task=2  --mem=96G --time=2:00:00 --array=0-14 slurm/laion15m.slurm
 #   STAGE=finalize sbatch -J l15-final   -p <parts> --cpus-per-task=1  --mem=8G  --time=0:30:00 slurm/laion15m.slurm
+#   STAGE=verify   sbatch -J l15-verify  -p <parts> --cpus-per-task=2  --mem=64G --time=1:00:00 slurm/laion15m.slurm
 #
 # The QoS allows 16 submitted jobs per user (array elements count). Array stages split their items round-robin over the array (SLURM_ARRAY_TASK_COUNT), and
 # skip finished outputs, so resubmitting a timed-out array is safe.
 set -euo pipefail
 cd ~/repos/plato/cave_umwelten
 mkdir -p logs
-STAGE=${STAGE:?set STAGE=sample|hash|dedup|scatter|pack|finalize}
+STAGE=${STAGE:?set STAGE=sample|hash|dedup|scatter|pack|finalize|verify}
 export PLATO_DATA_ROOT=~/datasets
 export OMP_NUM_THREADS=1
 ~/.local/bin/uv run python build_laion15m.py "$STAGE" ${EXTRA_ARGS:-}

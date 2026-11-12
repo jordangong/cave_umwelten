@@ -22,6 +22,7 @@ Stages, one per call, each resumable (finished outputs are skipped):
            -> work/buckets/bNNN/<split>-<file>.parquet
   pack     (array) per bucket: sort by pos, write 10k-row shards.
            -> laion_15m/train-NNNNN-of-01500.parquet
+  verify   independent checks on the shards (dups, WIT-1024, decode sample) -> verify.json
   finalize check all shards (row counts, pos = 0..N-1) and write the nested
            gallery indices: rows are in random order, so gallery n = rows [0, n).
            -> nested_indices/gallery_indices_<n>.npy
@@ -501,11 +502,56 @@ def stage_finalize(args):
     print(f"{len(shards)} shards ok; nested indices for {NESTED_SIZES} in {idx_dir}")
 
 
+def stage_verify(args):
+    """Independent checks on the finished shards: unique source rows, no repeated
+    caption, no two images within pHash Hamming <= 2, nothing matching WIT-1024,
+    and a random sample of images decodes as extract_features would."""
+    out_dir = os.path.join(out_root(args), "laion_15m")
+    shards = sorted(glob.glob(os.path.join(out_dir, "train-*.parquet")))
+    cols = ["pos", "id", "caption", "phash", "src_file", "src_row"]
+    t = pa.concat_tables([pq.read_table(f, columns=cols) for f in shards])
+    res = {"rows": t.num_rows}
+    res["pos_ok"] = bool(np.array_equal(t.column("pos").to_numpy(), np.arange(t.num_rows)))
+    src = pa.table({"f": t.column("src_file").combine_chunks().dictionary_encode().indices,
+                    "r": t.column("src_row")})
+    res["dup_src_rows"] = t.num_rows - src.group_by(["f", "r"]).aggregate([]).num_rows
+    res["dup_captions"] = t.num_rows - pc.count_distinct(t.column("caption")).as_py()
+    h = t.column("phash").to_numpy()
+    keep, info = image_dedup_keep(h)
+    res["phash_near_or_exact_dups"] = int((~keep).sum())
+    qh, qcap = wit1024_queries()
+    hit = 0
+    for i in range(0, len(h), 20_000):
+        hit += int((bitcount64(h[i:i + 20_000, None] ^ qh[None, :]) <= HAMMING).any(1).sum())
+    res["wit1024_image_hits"] = hit
+    res["wit1024_caption_hits"] = int(pc.sum(pc.is_in(t.column("caption"), value_set=pa.array(qcap))).as_py() or 0)
+    # decode a random sample the way extract_features does (PIL, convert RGB)
+    Image = _pil()
+    rng = np.random.default_rng(123)
+    bad, n = 0, 0
+    for s in rng.choice(len(shards), 30, replace=False):
+        imgs = pq.read_table(shards[s], columns=["image", "phash"])
+        for i in rng.choice(imgs.num_rows, 100, replace=False):
+            b = imgs.column("image")[int(i)].as_py()
+            im = Image.open(io.BytesIO(b)).convert("RGB")
+            n += 1
+            bad += phash_int(Image.open(io.BytesIO(b))) != imgs.column("phash")[int(i)].as_py() or im.size[0] == 0
+    res["sample_decoded"], res["sample_bad"] = n, bad
+    print(json.dumps(res, indent=1))
+    ok = (res["pos_ok"] and res["dup_src_rows"] == 0 and res["dup_captions"] == 0
+          and res["phash_near_or_exact_dups"] == 0 and hit == 0 and res["wit1024_caption_hits"] == 0 and bad == 0)
+    with open(os.path.join(out_root(args), "verify.json"), "w") as fh:
+        json.dump(res, fh, indent=1)
+    if not ok:
+        raise SystemExit("verify FAILED")
+    print("verify ok")
+
+
 # ----------------------------------------------------------------- main
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("stage", choices=["sample", "hash", "dedup", "scatter", "pack", "finalize"])
+    p.add_argument("stage", choices=["sample", "hash", "dedup", "scatter", "pack", "finalize", "verify"])
     p.add_argument("--out", default=None, help="output root (default $PLATO_DATA_ROOT/jordangong--laion-15m)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--task", type=int, default=None, help="array task id (default $SLURM_ARRAY_TASK_ID)")
