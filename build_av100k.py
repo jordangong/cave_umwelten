@@ -37,7 +37,7 @@ $SLURM_ARRAY_TASK_ID / $SLURM_ARRAY_TASK_COUNT):
     pack      (array) decode/resample the first CANDIDATES pool clips:
               Freesound in order-chunks, CLAPv2 grouped by source parquet
               -> work/packed/{oNNNN,pNNNN}.parquet
-    finalize  first 100k decoded clips -> laion_audio_100k/train-*.parquet,
+    finalize  first 100k decoded clips -> laion_audio_100k/train-000NN-of-00020.parquet,
               nested_indices/, stats.json
   pvd:
     index     (array) PE-Video train/test tars -> work/index/<split>-<tar>.parquet
@@ -69,7 +69,7 @@ import paths
 
 FINAL = 100_000
 N_QUERY = 1000
-SHARD_ROWS = 10_000
+SHARD_ROWS = {"laion_audio": 5_000, "pvd": 10_000}  # audio shards ~1 GB (binary offsets cap a column chunk at 2 GB)
 CANDIDATES = 102_000        # 2% reserve for clips that fail to decode
 CHUNK = 2000
 NESTED_SIZES = [5_000, 10_000, 50_000, 100_000]   # total gallery sizes, queries included
@@ -486,11 +486,16 @@ def stage_finalize(args):
         raise RuntimeError(f"{len(missing)}/{len(files)} pack units missing, e.g. {missing[0]}")
     pool_stats = json.load(open(wpath(args, "pool_stats.json")))
     cfg_dir = os.path.join(out_root(args), CONFIG_NAME[args.dataset])
-    nshards = FINAL // SHARD_ROWS
+    rows_per = SHARD_ROWS[args.dataset]
+    nshards = FINAL // rows_per
     if args.dataset == "laion_audio":
-        done = pa.concat_tables([pq.read_table(f) for f in files])
-        done = done.sort_by("order")
-        sel, stats = finalize_common(args, done, {"pool": pool_stats})
+        # 19 GB of FLAC: select on metadata only, then gather audio per output shard
+        # (a take/sort over one binary column > 2 GB overflows its 32-bit offsets)
+        tabs = [pq.read_table(f) for f in files]
+        meta = pa.concat_tables([
+            t.drop_columns(["audio"]).append_column("_f", pa.array(np.full(t.num_rows, i, np.int32)))
+             .append_column("_r", pa.array(np.arange(t.num_rows, dtype=np.int32))) for i, t in enumerate(tabs)])
+        sel, stats = finalize_common(args, meta.sort_by("order"), {"pool": pool_stats})
         sel = sel.drop_columns(["error"])
         stats["final_by_source"] = dict(collections.Counter(sel.column("source").to_pylist()))
         stats["query_by_source"] = dict(collections.Counter(sel.column("source").to_pylist()[:N_QUERY]))
@@ -519,10 +524,14 @@ def stage_finalize(args):
                 "category", "tar", "offset", "size", "decoded_frames", "dec_width", "dec_height", "dec_fps",
                 "fps", "duration", "width", "height"]
         prefix = "manifest"
-    sel = sel.select(cols)
     for s in range(nshards):
+        part = sel.slice(s * rows_per, rows_per)
+        if args.dataset == "laion_audio":
+            fi, ri = part.column("_f").to_pylist(), part.column("_r").to_pylist()
+            audio = [tabs[f].column("audio")[r].as_py() for f, r in zip(fi, ri)]
+            part = part.append_column("audio", pa.array(audio, pa.binary()))
         out = os.path.join(cfg_dir, f"{prefix}-{s:05d}-of-{nshards:05d}.parquet")
-        write_atomic(sel.slice(s * SHARD_ROWS, SHARD_ROWS), out, row_group_size=500)
+        write_atomic(part.select(cols), out, row_group_size=500)
     nested_indices(args)
     write_json(stats, os.path.join(out_root(args), "stats.json"))
     print(json.dumps({k: v for k, v in stats.items() if k != "pool"}, indent=2))
