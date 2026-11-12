@@ -289,16 +289,18 @@ def audio_pool(args):
         rows["size"].append(r["size"])
         rows["row"].append(-1)
     stats["sources"]["freesound"] = {"members": len(fs_rows), "unique": len(seen)}
-    # CLAPv2: one row per (source, text, length); the uploads repeat rows under two index names
+    # CLAPv2: one row per (source, text, length); the uploads repeat rows under two index names.
+    # This also merges distinct clips with equal text and length (Epidemic/Audiostock series);
+    # the caption dedup below would drop all but one of those anyway.
     ckeys = set()
     for r in clap.to_pylist():
         k = (r["source"], r["text"], round(r["audio_len"], 2))
-        st = stats["sources"].setdefault(r["source"], {"rows": 0, "unique": 0})
+        st = stats["sources"].setdefault(r["source"], {"rows": 0, "unique_text_len": 0})
         st["rows"] += 1
         if k in ckeys:
             continue
         ckeys.add(k)
-        st["unique"] += 1
+        st["unique_text_len"] += 1
         rows["source"].append(r["source"])
         rows["source_key"].append(f"{r['index']}|len={r['audio_len']:.2f}")
         rows["caption"].append(r["captions"][0] if r["captions"] else "")
