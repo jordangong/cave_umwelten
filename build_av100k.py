@@ -12,11 +12,12 @@ text-video). The paper gives only "a 100k subset of LAION-Audio-630k" and
                (Freesound title, Epidemic title, else CLAPv2 `text`), empty
                captions dropped, exact caption duplicates dropped (first
                occurrence in a seeded random order, as App. G.1.2 does for
-               WIT/LAION), then the first 100k clips of that order that decode.
+               WIT/LAION), then a fresh seeded order of what is left and its
+               first 100k clips that decode.
                Audio is stored decoded: mono, 16 kHz, first 30 s, FLAC.
   pvd          facebook/PE-Video human-captioned clips (train + test, 118,862),
                caption = human_caption, empty dropped, exact duplicates dropped,
-               first 100k of a seeded random order that decode. Videos stay in
+               first 100k of a fresh seeded order that decode. Videos stay in
                the source tars; the manifest holds (tar, offset, size) and the
                decoded frame count.
 
@@ -320,6 +321,10 @@ def finish_pool(args, t, stats):
     stats["empty_caption"] = t.num_rows - len(nonempty)
     t = t.take(pa.array(nonempty))
     t, ndup = order_and_dedup(t, "caption", args.seed)
+    # Fresh random order of the deduped pool (App. G.1: "randomly sampled from the final
+    # pool"). The dedup order itself is biased: a caption with c copies keeps its earliest
+    # copy, so heavily duplicated captions sit near the front and a prefix over-samples them.
+    t = t.take(pa.array(np.random.default_rng(args.seed + 1).permutation(t.num_rows)))
     stats["caption_duplicates"] = ndup
     stats["pool"] = t.num_rows
     t = t.append_column("order", pa.array(np.arange(t.num_rows, dtype=np.int64)))
