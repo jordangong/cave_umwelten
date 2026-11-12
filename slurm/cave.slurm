@@ -33,7 +33,7 @@
 #   DATASET=laion STAGE=knn MOD=vision|language  -> results/knn/laion_15m/<model>.pt (sizes 10K..15M)
 #   DATASET=laion STAGE=sweep [PERMS=0]          -> results/alignment/layer_sweep_laion15m/A__B.json
 #   DATASET=laion STAGE=align --array=0-4        Faiss cross-check up to 1M (5M+ needs n x 16 KB of RAM)
-# DATASET=audio|video: text-audio / text-video (Sec. 3.2.2, Fig. 6; build_av100k.py, docs/wit.md).
+# DATASET=audio|audio_nd|video: text-audio (audio_nd = near-duplicate captions removed too) / text-video (Sec. 3.2.2, Fig. 6; build_av100k.py, docs/wit.md).
 #   Queries are rows 0..999 of the 100k pool and sit in every gallery (sizes 5K 10K 50K 100K count them).
 #   STAGE=vision extracts the non-text modality (Dasheng / VideoMAEv2; VIS_MODEL overrides), item 0 = the
 #   queries -> results/features/<config>/query, items 1..11 = 9k-row gallery shards. PADDING defaults to batch.
@@ -49,10 +49,10 @@ cd "${SLURM_SUBMIT_DIR:-$HOME/repos/plato/cave_umwelten}"   # submit from the ch
 mkdir -p logs
 
 STAGE=${STAGE:?set STAGE=vision|language|layers|align|knn|sweep|plot}
-DATASET=${DATASET:-wit}                  # wit (WIT-1M) | laion (LAION-15M) | audio (LAION-Audio-100k) | video (PVD-100k)
+DATASET=${DATASET:-wit}                  # wit (WIT-1M) | laion (LAION-15M) | audio[_nd] (LAION-Audio-100k) | video (PVD-100k)
 PER_TASK=${PER_TASK:-1}
 case $DATASET in
-  audio) NT_MOD=audio;  NT_POOL=avg; VIS_MODEL=${VIS_MODEL:-mispeech/dasheng-base}; VIS_BS=${VIS_BS:-32}; PADDING=${PADDING:-batch} ;;
+  audio|audio_nd) NT_MOD=audio;  NT_POOL=avg; VIS_MODEL=${VIS_MODEL:-mispeech/dasheng-base}; VIS_BS=${VIS_BS:-32}; PADDING=${PADDING:-batch} ;;
   video) NT_MOD=video;  NT_POOL=avg; VIS_MODEL=${VIS_MODEL:-OpenGVLab/VideoMAEv2-Base}; VIS_BS=${VIS_BS:-16}; PADDING=${PADDING:-batch} ;;
   *)     NT_MOD=vision; NT_POOL=cls; VIS_MODEL=${VIS_MODEL:-vit_base_patch14_dinov2.lvd142m} ;;
 esac
@@ -71,6 +71,7 @@ export PLATO_CKPT_ROOT=~/checkpoints PLATO_DATA_ROOT=~/datasets
 FEAT=results/features
 case $DATASET in
   audio) Q_CONFIG=laion_audio_100k ;;
+  audio_nd) Q_CONFIG=laion_audio_100k_nd ;;
   video) Q_CONFIG=pvd_100k ;;
   *)     Q_CONFIG=wit_1024 ;;
 esac
@@ -97,11 +98,10 @@ case $DATASET in
     SIZES=(10000 50000 100000 500000 1000000 5000000 10000000 15000000)
     ALIGN_DIR=results/alignment/nested_laion15m; ALIGN_NAME=nested_laion15m
     KNN_DIR=results/knn/laion_15m; SWEEP_DIR=results/alignment/layer_sweep_laion15m; PERMS=${PERMS:-0} ;;
-  audio|video)
+  audio|audio_nd|video)
     [ "$CAPTION" = original ] || { echo "$Q_CONFIG has original captions only"; exit 1; }
     GAL=$Q_CONFIG; NUM_SHARDS=11; FIRST_SHARD_ITEM=1      # item 0 = queries, item i = gallery shard i-1
-    [ $DATASET = audio ] && IDX_DIR=$PLATO_DATA_ROOT/jordangong--laion-audio-100k/nested_indices \
-                         || IDX_DIR=$PLATO_DATA_ROOT/jordangong--pvd-100k/nested_indices
+    IDX_DIR=$PLATO_DATA_ROOT/jordangong--${GAL//_/-}/nested_indices   # laion_audio_100k_nd -> jordangong--laion-audio-100k-nd
     SIZES=(5000 10000 50000 100000)
     KNN_EXTRA=(--size_includes_queries --clamp pool)
     KNN_DIR=results/knn/$GAL; SWEEP_DIR=results/alignment/layer_sweep_$GAL; PERMS=${PERMS:-200} ;;
@@ -144,7 +144,7 @@ case $STAGE in
       extract "$STAGE" "$item"
     done ;;
   layers|align)
-    case $DATASET in audio|video) echo "STAGE=$STAGE is WIT/LAION only; use knn + sweep"; exit 1 ;; esac ;;&
+    case $DATASET in audio|audio_nd|video) echo "STAGE=$STAGE is WIT/LAION only; use knn + sweep"; exit 1 ;; esac ;;&
   layers)
     $UV run python find_best_layers.py --vision_path "$Q_VIS" --language_path "$Q_LANG" --output "$BEST" ;;
   align)

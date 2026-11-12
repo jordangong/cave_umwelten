@@ -21,6 +21,10 @@ text-video). The paper gives only "a 100k subset of LAION-Audio-630k" and
                the source tars; the manifest holds (tar, offset, size) and the
                decoded frame count.
 
+--dedup norm (ours, after the exact-dedup set showed it): also drops near-duplicate
+captions, so Freesound sample-pack siblings ("kama swipe 4." / "kama swipe 5.") keep
+one clip; written to jordangong--laion-audio-100k-nd/laion_audio_100k_nd/.
+
 Rows of both are in that random order, so the first 1000 rows are the fixed
 query set Q and the gallery of total size n (Q included, App. C) is rows
 [0, n). Gallery ids in nested_indices/ follow knn_sets.py's convention for
@@ -58,6 +62,7 @@ import glob
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 import time
@@ -93,6 +98,14 @@ PVD_DIR = "facebook--PE-Video"
 
 OUT_NAME = {"laion_audio": "jordangong--laion-audio-100k", "pvd": "jordangong--pvd-100k"}
 CONFIG_NAME = {"laion_audio": "laion_audio_100k", "pvd": "pvd_100k"}
+# --dedup norm: near-duplicate captions too (lowercased, digits/punctuation removed), so
+# sample-pack siblings ("kama swipe 4." / "kama swipe 5.") keep one clip; outputs get
+# a "-nd" / "_nd" suffix and live next to the exact-dedup set.
+ND_SUFFIX = {"exact": ("", ""), "norm": ("-nd", "_nd")}
+
+
+def norm_caption(c):
+    return re.sub(r"\s+", " ", re.sub(r"[\d\W_]+", " ", c.lower())).strip()
 
 
 # ----------------------------------------------------------------- helpers
@@ -102,10 +115,19 @@ def root():
 
 
 def out_root(args):
-    return os.path.expanduser(args.out) if args.out else os.path.join(root(), OUT_NAME[args.dataset])
+    if args.out:
+        return os.path.expanduser(args.out)
+    return os.path.join(root(), OUT_NAME[args.dataset] + ND_SUFFIX[args.dedup][0])
+
+
+def config_name(args):
+    return CONFIG_NAME[args.dataset] + ND_SUFFIX[args.dedup][1]
 
 
 def wpath(args, *p):
+    # the tar/CLAPv2 index is the same for both dedup modes: share the exact set's
+    if p and p[0] in ("fs_index", "clap_index.parquet", "index") and args.dedup != "exact" and not args.out:
+        return os.path.join(root(), OUT_NAME[args.dataset], "work", *p)
     return os.path.join(out_root(args), "work", *p)
 
 
@@ -320,7 +342,16 @@ def finish_pool(args, t, stats):
     stats["clips"] = t.num_rows
     stats["empty_caption"] = t.num_rows - len(nonempty)
     t = t.take(pa.array(nonempty))
-    t, ndup = order_and_dedup(t, "caption", args.seed)
+    if args.dedup == "norm":
+        keys = [norm_caption(c) for c in t.column("caption").to_pylist()]
+        keep = [i for i, k in enumerate(keys) if k]
+        stats["empty_normalized_caption"] = t.num_rows - len(keep)
+        t = t.take(pa.array(keep)).append_column("dedup_key", pa.array([keys[i] for i in keep]))
+    else:
+        t = t.append_column("dedup_key", t.column("caption"))
+    t, ndup = order_and_dedup(t, "dedup_key", args.seed)
+    t = t.drop_columns(["dedup_key"])
+    stats["dedup"] = args.dedup
     # Fresh random order of the deduped pool (App. G.1: "randomly sampled from the final
     # pool"). The dedup order itself is biased: a caption with c copies keeps its earliest
     # copy, so heavily duplicated captions sit near the front and a prefix over-samples them.
@@ -490,7 +521,7 @@ def stage_finalize(args):
     if missing:
         raise RuntimeError(f"{len(missing)}/{len(files)} pack units missing, e.g. {missing[0]}")
     pool_stats = json.load(open(wpath(args, "pool_stats.json")))
-    cfg_dir = os.path.join(out_root(args), CONFIG_NAME[args.dataset])
+    cfg_dir = os.path.join(out_root(args), config_name(args))
     rows_per = SHARD_ROWS[args.dataset]
     nshards = FINAL // rows_per
     if args.dataset == "laion_audio":
@@ -616,6 +647,9 @@ def main():
     p.add_argument("stage", choices=["index", "pool", "pack", "finalize"])
     p.add_argument("--out", default=None, help="output root (default $PLATO_DATA_ROOT/<jordangong--...>)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--dedup", choices=["exact", "norm"], default="exact",
+                   help="caption dedup: exact strings (App. G.1.2), or also near-duplicates "
+                        "(lowercase, digits/punctuation removed); norm writes <out>-nd/<config>_nd")
     p.add_argument("--task", type=int, default=None, help="array task id (default $SLURM_ARRAY_TASK_ID)")
     p.add_argument("--ntasks", type=int, default=None, help="array size (default $SLURM_ARRAY_TASK_COUNT)")
     args = p.parse_args()

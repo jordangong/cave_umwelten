@@ -11,6 +11,7 @@ Datasets (--config):
                      Shard i of the features = parquet file i.
   laion_audio_100k   jordangong/laion-audio-100k (ours, build_av100k.py): decoded
                      16 kHz mono audio (first 30 s, FLAC) + first caption
+  laion_audio_100k_nd  the same with near-duplicate captions removed (build_av100k --dedup norm)
   pvd_100k           jordangong/pvd-100k (ours, build_av100k.py): manifest of
                      PE-Video clips (tar, offset, size) + human caption
                      For both, rows 0..999 are the fixed queries (no --shard_id)
@@ -74,10 +75,11 @@ CONFIGS = {
     "laion_15m": ("jordangong/laion-15m", "caption", 15_000_000, 1500),
     "laion_audio_100k": ("jordangong/laion-audio-100k", "caption", 100_000, 11),
     "pvd_100k": ("jordangong/pvd-100k", "caption", 100_000, 11),
+    "laion_audio_100k_nd": ("jordangong/laion-audio-100k-nd", "caption", 100_000, 11),
 }
 # query-in-pool configs: non-text modality, queries = rows [0, AV_QUERIES), gallery
 # shard s = rows AV_QUERIES + [s * AV_SHARD_ROWS, (s + 1) * AV_SHARD_ROWS)
-AV_CONFIGS = {"laion_audio_100k": "audio", "pvd_100k": "video"}
+AV_CONFIGS = {"laion_audio_100k": "audio", "pvd_100k": "video", "laion_audio_100k_nd": "audio"}
 AV_QUERIES = 1000
 AV_SHARD_ROWS = 9000
 DEFAULT_VISION_MODEL = "vit_base_patch14_dinov2.lvd142m"
