@@ -9,6 +9,13 @@ Datasets (--config):
   laion_15m          jordangong/laion-15m (ours, built by build_laion15m.py; local
                      only): 1500 parquet files x 10k rows, columns image/caption.
                      Shard i of the features = parquet file i.
+  laion_audio_100k   jordangong/laion-audio-100k (ours, build_av100k.py): decoded
+                     16 kHz mono audio (first 30 s, FLAC) + first caption
+  pvd_100k           jordangong/pvd-100k (ours, build_av100k.py): manifest of
+                     PE-Video clips (tar, offset, size) + human caption
+                     For both, rows 0..999 are the fixed queries (no --shard_id)
+                     and gallery shard s = rows 1000 + [9000 s, 9000 (s+1)),
+                     s = 0..10 (paper Sec. 3.2.2 / App. C).
 
 Output format (matches the format consumed by align_nested_wit1m.py):
   {
@@ -21,6 +28,15 @@ Output format (matches the format consumed by align_nested_wit1m.py):
 
 Vision tap points match cave_final: `blocks.{i}.add_1` (post-residual-add in
 each ViT block), CLS token.
+
+Audio (ours; the paper gives only "Dasheng"): HF DashengModel, log-mel of the
+first target_length frames (10.08 s), output of each transformer block,
+mean over its time-frequency tokens (Dasheng's own pooling), fp32.
+
+Video (ours; the paper gives only "VideoMAE-v2"): OpenGVLab VideoMAEv2, 16
+frames sampled uniformly over the clip (segment centres), short side resized
+to 224 and centre-cropped, ImageNet normalisation (its preprocessor config),
+output of each block, mean over tokens (the model's own pooling), fp32.
 
 Language pooling matches cave_final: avg-pooled over non-pad positions, with
 hidden states from all layers (embedding layer included).  Tokenization uses
@@ -56,9 +72,18 @@ CONFIGS = {
     "wit_1024": (DATASET_ID, "original_caption", 1024, None),
     "wit_1m": (DATASET_ID, "original_caption", 1_000_000, 100),
     "laion_15m": ("jordangong/laion-15m", "caption", 15_000_000, 1500),
+    "laion_audio_100k": ("jordangong/laion-audio-100k", "caption", 100_000, 11),
+    "pvd_100k": ("jordangong/pvd-100k", "caption", 100_000, 11),
 }
+# query-in-pool configs: non-text modality, queries = rows [0, AV_QUERIES), gallery
+# shard s = rows AV_QUERIES + [s * AV_SHARD_ROWS, (s + 1) * AV_SHARD_ROWS)
+AV_CONFIGS = {"laion_audio_100k": "audio", "pvd_100k": "video"}
+AV_QUERIES = 1000
+AV_SHARD_ROWS = 9000
 DEFAULT_VISION_MODEL = "vit_base_patch14_dinov2.lvd142m"
 DEFAULT_LANGUAGE_MODEL = "openlm-research/open_llama_3b"
+DEFAULT_AUDIO_MODEL = "mispeech/dasheng-base"
+DEFAULT_VIDEO_MODEL = "OpenGVLab/VideoMAEv2-Base"
 DEFAULT_NUM_SHARDS_WIT1M = 100
 
 
@@ -118,6 +143,19 @@ def load_rows(config, start, end, modality, caption):
     dataset_id, caption_field = CONFIGS[config][:2]
     if caption == "gemini" and config == "laion_15m":
         raise ValueError("laion_15m has no Gemini captions")
+    if config in AV_CONFIGS:
+        if caption == "gemini":
+            raise ValueError(f"{config} has no Gemini captions")
+        if modality not in ("language", AV_CONFIGS[config]):
+            raise ValueError(f"{config} has {AV_CONFIGS[config]} and language, not {modality}")
+        files = paths.local_parquets(dataset_id, config)
+        if files is None:
+            raise FileNotFoundError(f"no local copy of {dataset_id}/{config} under {paths.data_root()}")
+        cols = {"language": [caption_field], "audio": ["audio", "num_samples"],
+                "video": ["tar", "offset", "size", "decoded_frames"]}[modality]
+        print(f"Reading {cols} from {len(files)} local parquet files in {os.path.dirname(files[0])}")
+        data = [_load_rows_local(files, start, end, c) for c in cols]
+        return data[0] if modality == "language" else [dict(zip(cols, r)) for r in zip(*data)]
     field = "image" if modality == "vision" else (
         "gemini_caption" if caption == "gemini" else caption_field)
     files = paths.local_parquets(dataset_id, config)
@@ -244,6 +282,177 @@ def extract_vision(images, model_name, batch_size, layer_indices, num_workers=8)
     all_feats = torch.cat(all_feats, dim=0)
     print(f"Features shape: {all_feats.shape}")
     return all_feats, num_params, block_ids
+
+
+# ---------------------------------------------------------------- audio/video
+
+def _block_taps(blocks, block_ids):
+    """Forward hooks storing the token-mean of each chosen block's output."""
+    taps, handles = {}, []
+    for i in block_ids:
+        def hook(_m, _inp, out, i=i):
+            taps[i] = out.float().mean(1)
+        handles.append(blocks[i].register_forward_hook(hook))
+    return taps, handles
+
+
+def _length_batches(lengths, batch_size):
+    """Batches of equal-length items (exact: no padding inside a batch)."""
+    by_len = {}
+    for i, n in enumerate(lengths):
+        by_len.setdefault(n, []).append(i)
+    batches = []
+    for n in sorted(by_len, reverse=True):
+        idx = by_len[n]
+        batches += [idx[j:j + batch_size] for j in range(0, len(idx), batch_size)]
+    return batches
+
+
+class _AudioDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, model_dir, max_frames):
+        self.rows, self.model_dir, self.max_frames = rows, model_dir, max_frames
+        self.fe = None
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        import soundfile as sf
+        if self.fe is None:  # per worker
+            from transformers import AutoFeatureExtractor
+            self.fe = AutoFeatureExtractor.from_pretrained(self.model_dir, trust_remote_code=True)
+        x, sr = sf.read(io.BytesIO(self.rows[i]["audio"]), dtype="float32")
+        assert sr == self.fe.sampling_rate, (sr, self.fe.sampling_rate)
+        hop = self.fe.hop_size
+        x = x[: (self.max_frames - 1) * hop]  # exactly <= max_frames log-mel frames (center=True)
+        # one clip per call: AmplitudeToDB's top_db is taken over the whole input tensor
+        mel = self.fe(x, sampling_rate=sr, return_tensors="pt")["input_values"][0]
+        return i, mel[:, : self.max_frames]
+
+
+def audio_frames(num_samples, hop, max_frames):
+    return [min(max_frames, n // hop + 1) for n in num_samples]
+
+
+def extract_audio(rows, model_name, batch_size, layer_indices, num_workers=8):
+    from transformers import AutoModel
+    model_dir = paths.resolve_llm(model_name)
+    model = AutoModel.from_pretrained(model_dir, trust_remote_code=True).cuda().eval()
+    num_params = sum(p.numel() for p in model.parameters())
+    enc = model.encoder
+    max_frames = enc.target_length
+    blocks = enc.blocks
+    block_ids = layer_indices if layer_indices is not None else list(range(len(blocks)))
+    print(f"\nmodel:       \t{model_name}\nnum_samples: \t{len(rows)}\nnum_params:  \t{num_params:,}")
+    print(f"target_length {max_frames} frames; extracting blocks {block_ids} of {len(blocks)}")
+
+    ds = _AudioDataset(rows, model_dir, max_frames)
+    from transformers import AutoFeatureExtractor
+    hop = AutoFeatureExtractor.from_pretrained(model_dir, trust_remote_code=True).hop_size
+    frames = audio_frames([r["num_samples"] for r in rows], hop, max_frames)
+    batches = _length_batches(frames, batch_size)
+    print(f"{len(batches)} equal-length batches; {sum(f == max_frames for f in frames)} clips at full length")
+    loader = torch.utils.data.DataLoader(ds, batch_sampler=batches, num_workers=num_workers,
+                                         collate_fn=lambda b: (torch.tensor([i for i, _ in b]),
+                                                               torch.stack([m for _, m in b])))
+    taps, handles = _block_taps(blocks, block_ids)
+    feats = torch.empty(len(rows), len(block_ids), enc.embed_dim)
+    for idx, mel in tqdm(loader, total=len(batches), desc=model_name):
+        assert mel.shape[-1] == frames[idx[0]], (mel.shape, frames[idx[0]])
+        with torch.no_grad():
+            model(input_values=mel.cuda(non_blocking=True))
+        feats[idx] = torch.stack([taps[i] for i in block_ids], 1).cpu()
+    for h in handles:
+        h.remove()
+    print(f"Features shape: {feats.shape}")
+    return feats, num_params, block_ids
+
+
+def sample_frame_indices(n, num_frames):
+    """Centres of num_frames equal segments of an n-frame clip."""
+    return [min(n - 1, int((j + 0.5) * n / num_frames)) for j in range(num_frames)]
+
+
+def decode_frames(b, n_expected, num_frames):
+    """uint8 [num_frames, H, W, 3] at sample_frame_indices(n, num_frames). n is the
+    decoded frame count from the manifest; if the decode disagrees, decode again
+    with the real count."""
+    import av
+    import numpy as np
+    for attempt in range(2):
+        want = sample_frame_indices(n_expected, num_frames)
+        wanted = set(want)
+        got, n = {}, 0
+        with av.open(io.BytesIO(b)) as c:
+            s = c.streams.video[0]
+            s.thread_type = "AUTO"
+            for fr in c.decode(s):
+                if n in wanted:
+                    got[n] = fr.to_ndarray(format="rgb24")
+                n += 1
+        if n == n_expected or attempt == 1:
+            break
+        print(f"WARNING: decoded {n} frames, manifest says {n_expected}; redecoding", flush=True)
+        n_expected = n
+    return np.stack([got[min(i, max(got))] for i in want])
+
+
+class _VideoDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, num_frames, size, mean, std):
+        self.rows, self.num_frames, self.size = rows, num_frames, size
+        self.mean = torch.tensor(mean).view(3, 1, 1, 1)
+        self.std = torch.tensor(std).view(3, 1, 1, 1)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        import torch.nn.functional as F
+        r = self.rows[i]
+        with open(os.path.join(paths.data_root(), r["tar"]), "rb") as f:
+            f.seek(r["offset"])
+            b = f.read(r["size"])
+        x = torch.from_numpy(decode_frames(b, r["decoded_frames"], self.num_frames))  # T H W 3
+        x = x.permute(0, 3, 1, 2).float()                                               # T 3 H W
+        h, w = x.shape[-2:]
+        sc = self.size / min(h, w)
+        nh, nw = max(self.size, round(h * sc)), max(self.size, round(w * sc))
+        x = F.interpolate(x, size=(nh, nw), mode="bilinear", antialias=True, align_corners=False)
+        t, l = (nh - self.size) // 2, (nw - self.size) // 2
+        x = x[..., t:t + self.size, l:l + self.size].clamp(0, 255) / 255.0
+        x = x.permute(1, 0, 2, 3)                                                       # 3 T S S
+        return (x - self.mean) / self.std
+
+
+def extract_video(rows, model_name, batch_size, layer_indices, num_workers=8):
+    import json as _json
+    from transformers import AutoConfig, AutoModel
+    model_dir = paths.resolve_llm(model_name)
+    cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_dir, config=cfg, trust_remote_code=True).cuda().eval()
+    num_params = sum(p.numel() for p in model.parameters())
+    vit = model.model
+    mc = cfg.model_config
+    pp = _json.load(open(os.path.join(model_dir, "preprocessor_config.json")))
+    num_frames, size = mc["num_frames"], mc["img_size"]
+    block_ids = layer_indices if layer_indices is not None else list(range(len(vit.blocks)))
+    print(f"\nmodel:       \t{model_name}\nnum_samples: \t{len(rows)}\nnum_params:  \t{num_params:,}")
+    print(f"{num_frames} frames at {size}px, mean {pp['image_mean']} std {pp['image_std']}; "
+          f"extracting blocks {block_ids} of {len(vit.blocks)}")
+    loader = torch.utils.data.DataLoader(
+        _VideoDataset(rows, num_frames, size, pp["image_mean"], pp["image_std"]),
+        batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    taps, handles = _block_taps(vit.blocks, block_ids)
+    all_feats = []
+    for xs in tqdm(loader, desc=model_name):
+        with torch.no_grad():
+            vit.forward_features(xs.cuda(non_blocking=True))
+        all_feats.append(torch.stack([taps[i] for i in block_ids], 1).cpu())
+    for h in handles:
+        h.remove()
+    feats = torch.cat(all_feats)
+    print(f"Features shape: {feats.shape}")
+    return feats, num_params, block_ids
 
 
 # ------------------------------------------------------------------- language
@@ -381,15 +590,16 @@ def extract_language(texts, model_name, batch_size, max_length, pool, layer_indi
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--modality", choices=["vision", "language"], required=True)
+    p.add_argument("--modality", choices=["vision", "language", "audio", "video"], required=True)
     p.add_argument("--config", choices=list(CONFIGS), required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--model", default=None,
                    help="Model name. Defaults: "
-                        f"vision={DEFAULT_VISION_MODEL}, language={DEFAULT_LANGUAGE_MODEL}")
+                        f"vision={DEFAULT_VISION_MODEL}, language={DEFAULT_LANGUAGE_MODEL}, "
+                        f"audio={DEFAULT_AUDIO_MODEL}, video={DEFAULT_VIDEO_MODEL}")
     p.add_argument("--caption", choices=["original", "gemini"], default="original")
     p.add_argument("--batch_size", type=int, default=None,
-                   help="Default: 64 for vision, 4 for language (matches cave_final)")
+                   help="Default: 64 for vision, 4 for language (matches cave_final), 32 audio, 16 video")
     p.add_argument("--max_length", type=int, default=512)
     p.add_argument("--pool", choices=["avg", "last"], default="avg")
     p.add_argument("--padding", choices=["shard", "batch"], default="shard",
@@ -401,7 +611,7 @@ def main():
     p.add_argument("--max_gpu_memory", default=None,
                    help='Cap LLM weights per GPU, e.g. "9GiB" (offload rest to CPU)')
     p.add_argument("--num_workers", type=int, default=8,
-                   help="DataLoader workers for image decoding (vision only)")
+                   help="DataLoader workers for image/audio/video decoding")
     # sharding (wit_1m)
     p.add_argument("--shard_id", type=int, default=None)
     p.add_argument("--num_shards", type=int, default=None,
@@ -413,9 +623,10 @@ def main():
     args = p.parse_args()
 
     if args.model is None:
-        args.model = DEFAULT_VISION_MODEL if args.modality == "vision" else DEFAULT_LANGUAGE_MODEL
+        args.model = {"vision": DEFAULT_VISION_MODEL, "language": DEFAULT_LANGUAGE_MODEL,
+                      "audio": DEFAULT_AUDIO_MODEL, "video": DEFAULT_VIDEO_MODEL}[args.modality]
     if args.batch_size is None:
-        args.batch_size = 64 if args.modality == "vision" else 4
+        args.batch_size = {"vision": 64, "language": 4, "audio": 32, "video": 16}[args.modality]
 
     if args.num_shards is None:
         args.num_shards = CONFIGS[args.config][3] or DEFAULT_NUM_SHARDS_WIT1M
@@ -424,9 +635,20 @@ def main():
         if args.shard_id is None or args.num_shards != CONFIGS[args.config][3]:
             raise ValueError(f"{args.config} needs --shard_id, and --num_shards {CONFIGS[args.config][3]}")
     sharded = args.config != "wit_1024" and args.shard_id is not None
+    av = args.config in AV_CONFIGS
 
     # Figure out row range
-    if not sharded:
+    if av:
+        if args.shard_id is None:
+            start, end = 0, AV_QUERIES
+            print(f"{args.config} queries: samples [{start}, {end})")
+        else:
+            if not 0 <= args.shard_id < args.num_shards:
+                raise ValueError(f"{args.config} gallery shards are 0..{args.num_shards - 1}")
+            start = AV_QUERIES + args.shard_id * AV_SHARD_ROWS
+            end = min(CONFIGS[args.config][2], start + AV_SHARD_ROWS)
+            print(f"{args.config} gallery shard {args.shard_id}: samples [{start}, {end})")
+    elif not sharded:
         total = get_dataset_length(args.config)
         start, end = 0, total
     else:
@@ -443,7 +665,8 @@ def main():
     # Resolve save path. Gemini-caption language features get a "_gemini" tag
     # so they don't overwrite the original-caption ones (upstream computed the
     # tag but never used it).
-    pool_tag = "pool-cls" if args.modality == "vision" else f"pool-{args.pool}"
+    pool_tag = {"vision": "pool-cls", "audio": "pool-avg", "video": "pool-avg"}.get(
+        args.modality, f"pool-{args.pool}")
     model_dir_name = _safe_name(args.model)
     cap_tag = "_gemini" if (args.modality == "language" and args.caption == "gemini") else ""
 
@@ -467,13 +690,16 @@ def main():
         rows = load_rows(args.config, start, end, args.modality, args.caption)
 
     # Extract
-    if args.modality == "vision":
-        feats, num_params, block_ids = extract_vision(
+    if args.modality in ("vision", "audio", "video"):
+        fn = {"vision": extract_vision, "audio": extract_audio, "video": extract_video}[args.modality]
+        feats, num_params, block_ids = fn(
             rows, args.model, args.batch_size, args.layer_indices, args.num_workers,
         )
         save_dict = {"feats": feats, "num_params": num_params}
         if args.layer_indices is not None:
             save_dict["layer_indices"] = args.layer_indices
+        if av:
+            save_dict["rows"] = [start, end]
     else:
         feats, num_params, mask = extract_language(
             rows, args.model, args.batch_size, args.max_length,
@@ -485,6 +711,8 @@ def main():
             save_dict["mask"] = mask
         if args.layer_indices is not None:
             save_dict["layer_indices"] = args.layer_indices
+        if av:
+            save_dict["rows"] = [start, end]
 
     if sharded:
         save_dict["shard_id"] = args.shard_id

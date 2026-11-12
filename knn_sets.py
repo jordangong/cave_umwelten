@@ -34,6 +34,19 @@ gallery the same way):
         --query_path results/features/wit_1024/openlm-research_open_llama_3b_pool-avg.pt \
         --shard_dir  results/features/wit_1m/shards/openlm-research_open_llama_3b \
         --output     results/knn/openlm-research_open_llama_3b.pt
+
+Text-audio / text-video (Sec. 3.2.2, App. C; build_av100k.py): the 1000 queries
+are a random part of the 100k pool and every gallery contains them, so a size n
+means n rows in total, queries included (--size_includes_queries: the index file
+for n holds n - 1000 gallery ids and k = n/100 uses that n). App. C prepares
+features once over the full pool, so --clamp pool takes one clamp value per
+layer from all queries + gallery rows and uses it for every size:
+
+    python knn_sets.py --query_path results/features/laion_audio_100k/query/<model>_pool-avg.pt \
+        --shard_dir results/features/laion_audio_100k/shards/<model> \
+        --gallery_indices_dir $PLATO_DATA_ROOT/jordangong--laion-audio-100k/nested_indices \
+        --sizes 5000 10000 50000 100000 --size_includes_queries --clamp pool \
+        --output results/knn/laion_audio_100k/<model>.pt
 """
 import argparse
 import glob
@@ -162,6 +175,12 @@ def main():
     p.add_argument("--n_total", type=int, default=None,
                    help="rows in the shard set; default: the shards' total (checked if given)")
     p.add_argument("--sample", type=int, default=SAMPLE, help="clamp-quantile sample size (tests)")
+    p.add_argument("--size_includes_queries", action="store_true",
+                   help="sizes count the queries: gallery_indices_<n>.npy holds n - (#queries) ids")
+    p.add_argument("--clamp", choices=["gallery", "pool"], default="gallery",
+                   help="gallery: per-size clamp from a sample of that gallery, exact query-set clamp for "
+                        "the queries (align_nested_wit1m); pool: one exact clamp over queries + all "
+                        "gallery rows for everything (App. C)")
     args = p.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -181,50 +200,67 @@ def main():
     assert args.n_total is None or args.n_total == N_TOTAL, (args.n_total, N_TOTAL)
     print(f"{len(shard_files)} shards, {N_TOTAL:,} gallery rows")
 
+    # ---- queries (features prepared below)
+    qd = torch.load(args.query_path, map_location="cpu")
+    qfeats = qd["feats"]
+    nq = qfeats.shape[0]
+
     sizes = sorted(args.sizes)
+    n_extra = nq if args.size_includes_queries else 0
     nested = {n: np.load(os.path.join(args.gallery_indices_dir, f"gallery_indices_{n}.npy")) for n in sizes}
     # Membership rank: smallest size index whose gallery has this row (nested sets).
     rank = np.full(N_TOTAL, len(sizes), dtype=np.int8)
     for si in reversed(range(len(sizes))):
         rank[nested[sizes[si]]] = si
     for si, n in enumerate(sizes):
-        assert (rank <= si).sum() == n, f"galleries are not nested at {n}"
-
-    # ---- queries
-    qd = torch.load(args.query_path, map_location="cpu")
-    qfeats = qd["feats"]
+        assert len(nested[n]) == n - n_extra, f"gallery_indices_{n}: {len(nested[n])} ids, want {n - n_extra}"
+        assert (rank <= si).sum() == n - n_extra, f"galleries are not nested at {n}"
     query_ids = qd.get("layer_indices") or list(range(qfeats.shape[1]))
     layer_ids = args.layers if args.layers is not None else shard_ids
     q_pos = [query_ids.index(i) for i in layer_ids]   # query layer axis may hold more layers
     layers = [shard_ids.index(i) for i in layer_ids]  # positions in the shards' layer axis
     L = len(layers)
-    nq = qfeats.shape[0]
-    qn, q_query = [], []
-    for l in q_pos:
+
+    # ---- pass 1: clamp values (per size and layer, or one per layer for the pool)
+    if args.clamp == "pool":
+        pacc = AbsQuantile(L)
+        pacc.add(qfeats[:, q_pos])
+        for sf in shard_files:
+            g = torch.load(sf, map_location="cpu", mmap=True)["feats"]
+            assert g.dtype == qfeats.dtype, f"{sf}: {g.dtype} vs queries {qfeats.dtype}"
+            pacc.add(g[:, layers])
+            del g
+        q_pool = pacc.values()
+        del pacc
+        q_query, q_gal = q_pool, {n: q_pool for n in sizes}
+    else:
+        samples = {n: quantile_sample(nested[n], sample_size=args.sample) for n in sizes}
+        qacc = {n: AbsQuantile(L) for n in sizes}
+        for si, sf in enumerate(shard_files):
+            lo, hi = starts[si], starts[si + 1]
+            local = {n: s[(s >= lo) & (s < hi)] - lo for n, s in samples.items()}
+            union = np.unique(np.concatenate(list(local.values())))
+            if len(union) == 0:
+                continue
+            feats = torch.load(sf, map_location="cpu", mmap=True)["feats"]
+            rows = feats[torch.from_numpy(union)][:, layers]
+            for n in sizes:
+                qacc[n].add(rows[torch.from_numpy(np.searchsorted(union, local[n]))])
+            del feats, rows
+        q_gal = {n: qacc[n].values() for n in sizes}
+        del qacc
+        q_query = []
+        for l in q_pos:
+            x = qfeats[:, l, :].float()
+            q_query.append(x.reshape(-1).abs().sort().values[int(Q * x.numel())].item())
+    print(f"pass 1 (clamp values, {args.clamp}) done, {time.time() - t0:.0f}s")
+
+    qn = []
+    for qv, l in zip(q_query, q_pos):
         x = qfeats[:, l, :].float()
-        qv = x.reshape(-1).abs().sort().values[int(Q * x.numel())].item()
-        q_query.append(qv)
         qn.append(F.normalize(x.clamp(-qv, qv), dim=-1))
     qn = torch.stack(qn).to(dev)  # [L, nq, D]
     print(f"queries {tuple(qfeats.shape)}, layer ids {layer_ids}, {len(shard_files)} shards")
-
-    # ---- pass 1: per-size, per-layer gallery clamp values
-    samples = {n: quantile_sample(nested[n], sample_size=args.sample) for n in sizes}
-    qacc = {n: AbsQuantile(L) for n in sizes}
-    for si, sf in enumerate(shard_files):
-        lo, hi = starts[si], starts[si + 1]
-        local = {n: s[(s >= lo) & (s < hi)] - lo for n, s in samples.items()}
-        union = np.unique(np.concatenate(list(local.values())))
-        if len(union) == 0:
-            continue
-        feats = torch.load(sf, map_location="cpu", mmap=True)["feats"]
-        rows = feats[torch.from_numpy(union)][:, layers]
-        for n in sizes:
-            qacc[n].add(rows[torch.from_numpy(np.searchsorted(union, local[n]))])
-        del feats, rows
-    q_gal = {n: qacc[n].values() for n in sizes}
-    del qacc
-    print(f"pass 1 (clamp values) done, {time.time() - t0:.0f}s")
     for n in sizes:
         print(f"  n={n:>8,}  q[{layer_ids[0]}]={q_gal[n][0]:.5f}  q[{layer_ids[-1]}]={q_gal[n][-1]:.5f}")
 
@@ -266,7 +302,8 @@ def main():
 
     out = {"sizes": [nq] + sizes, "knn": {}, "sim": {}, "layers": list(layer_ids),
            "q_query": q_query, "q_gallery": q_gal, "query_path": args.query_path,
-           "shard_dir": args.shard_dir, "query_id0": QUERY_ID0}
+           "shard_dir": args.shard_dir, "query_id0": QUERY_ID0,
+           "size_includes_queries": args.size_includes_queries, "clamp": args.clamp}
     out["knn"][nq], out["sim"][nq] = q_only.finish()
     for n in sizes:
         out["knn"][n], out["sim"][n] = state[n].finish()

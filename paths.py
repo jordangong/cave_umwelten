@@ -6,6 +6,7 @@ HF Hub when a local copy exists. Same env vars as platonic-rep's paths.py:
         <root>/askoepke--wit_1m_recaptioned/<config>/train-*.parquet
     PLATO_CKPT_ROOT (default ~/checkpoints)
         <root>/gen/<modality-tag>/<Vendor>/[<Family>/]<model>/   (HF causal LMs)
+        <root>/emb/<modality-tag>/<Vendor>/[<Family>/]<model>/   (HF encoders: Dasheng, VideoMAEv2)
         <root>/timm/<timm-model-name>/model.safetensors        (timm models)
 
 Anything not found locally falls back to the Hub, as upstream does.
@@ -34,13 +35,14 @@ def local_parquets(dataset_id, config):
 
 
 def resolve_llm(model_name):
-    """HF id -> local model dir if found in the pool, else the id."""
+    """HF id -> local model dir if found in the pool (gen/ or emb/), else the id."""
     if os.path.isdir(model_name):
         return model_name
     base = model_name.split("/")[-1]
     root = ckpt_root()
     hits = []
-    for pattern in (f"{root}/gen/*/*/*/{base}", f"{root}/gen/*/*/{base}"):
+    for pattern in (f"{root}/gen/*/*/*/{base}", f"{root}/gen/*/*/{base}",
+                    f"{root}/emb/*/*/*/{base}", f"{root}/emb/*/*/{base}"):
         hits += [d for d in glob.glob(pattern) if os.path.isfile(os.path.join(d, "config.json"))]
     if len(hits) > 1:
         txt_hits = [d for d in hits if f"{root}/gen/txt/" in d]

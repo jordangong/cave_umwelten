@@ -33,16 +33,29 @@
 #   DATASET=laion STAGE=knn MOD=vision|language  -> results/knn/laion_15m/<model>.pt (sizes 10K..15M)
 #   DATASET=laion STAGE=sweep [PERMS=0]          -> results/alignment/layer_sweep_laion15m/A__B.json
 #   DATASET=laion STAGE=align --array=0-4        Faiss cross-check up to 1M (5M+ needs n x 16 KB of RAM)
+# DATASET=audio|video: text-audio / text-video (Sec. 3.2.2, Fig. 6; build_av100k.py, docs/wit.md).
+#   Queries are rows 0..999 of the 100k pool and sit in every gallery (sizes 5K 10K 50K 100K count them).
+#   STAGE=vision extracts the non-text modality (Dasheng / VideoMAEv2; VIS_MODEL overrides), item 0 = the
+#   queries -> results/features/<config>/query, items 1..11 = 9k-row gallery shards. PADDING defaults to batch.
+#   DATASET=audio STAGE=vision   sbatch ... --array=0-11 slurm/cave.slurm        (or PER_TASK=12 --array=0)
+#   DATASET=audio STAGE=language LANG_MODEL=google/gemma-2-9b PER_TASK=12 sbatch ... --array=0 slurm/cave.slurm
+#   DATASET=audio STAGE=knn MOD=vision|language   -> results/knn/laion_audio_100k/<model>.pt (pool clamp, App. C)
+#   DATASET=audio STAGE=sweep                     -> results/alignment/layer_sweep_laion_audio_100k/A__B.json
+#   No layers/align stages: the sweep's `fixed` pair is the best k=10 pair at the 1k query level.
 # Q_DIR / Q_LANG override the query features (e.g. batch-padded WIT-1024 language features);
 # KNN_NAME overrides the knn output name. Q_OUT redirects WIT-1024 extraction (item 0).
 set -euo pipefail
-cd ~/repos/plato/cave_umwelten
+cd "${SLURM_SUBMIT_DIR:-$HOME/repos/plato/cave_umwelten}"   # submit from the checkout (or worktree) root
 mkdir -p logs
 
 STAGE=${STAGE:?set STAGE=vision|language|layers|align|knn|sweep|plot}
-DATASET=${DATASET:-wit}                  # wit (WIT-1M gallery) | laion (LAION-15M gallery)
+DATASET=${DATASET:-wit}                  # wit (WIT-1M) | laion (LAION-15M) | audio (LAION-Audio-100k) | video (PVD-100k)
 PER_TASK=${PER_TASK:-1}
-VIS_MODEL=${VIS_MODEL:-vit_base_patch14_dinov2.lvd142m}
+case $DATASET in
+  audio) NT_MOD=audio;  NT_POOL=avg; VIS_MODEL=${VIS_MODEL:-mispeech/dasheng-base}; VIS_BS=${VIS_BS:-32}; PADDING=${PADDING:-batch} ;;
+  video) NT_MOD=video;  NT_POOL=avg; VIS_MODEL=${VIS_MODEL:-OpenGVLab/VideoMAEv2-Base}; VIS_BS=${VIS_BS:-16}; PADDING=${PADDING:-batch} ;;
+  *)     NT_MOD=vision; NT_POOL=cls; VIS_MODEL=${VIS_MODEL:-vit_base_patch14_dinov2.lvd142m} ;;
+esac
 LANG_MODEL=${LANG_MODEL:-openlm-research/open_llama_3b}
 VIS_BS=${VIS_BS:-64}
 LANG_BS=${LANG_BS:-16}
@@ -56,13 +69,20 @@ CAP_TAG=$([ "$CAPTION" = gemini ] && echo _gemini || true)
 export PLATO_CKPT_ROOT=~/checkpoints PLATO_DATA_ROOT=~/datasets
 
 FEAT=results/features
-Q_DIR=${Q_DIR:-$FEAT/wit_1024}
-Q_OUT=${Q_OUT:-$FEAT/wit_1024}
-Q_VIS=${Q_VIS:-$Q_DIR/${VIS_MODEL}_pool-cls.pt}
+case $DATASET in
+  audio) Q_CONFIG=laion_audio_100k ;;
+  video) Q_CONFIG=pvd_100k ;;
+  *)     Q_CONFIG=wit_1024 ;;
+esac
+Q_DEF=$FEAT/$Q_CONFIG; [ "$Q_CONFIG" = wit_1024 ] || Q_DEF=$FEAT/$Q_CONFIG/query
+Q_DIR=${Q_DIR:-$Q_DEF}
+Q_OUT=${Q_OUT:-$Q_DEF}
+Q_VIS=${Q_VIS:-$Q_DIR/${VIS_MODEL//\//_}_pool-${NT_POOL}.pt}
 Q_LANG=${Q_LANG:-$Q_DIR/${LANG_MODEL//\//_}_pool-avg${CAP_TAG}.pt}
 BEST=results/best_layers${CAP_TAG}.json
 VIS_NAME=${VIS_MODEL//\//_}
 LANG_NAME=${LANG_MODEL//\//_}${CAP_TAG}
+KNN_EXTRA=()
 case $DATASET in
   wit)
     GAL=wit_1m; NUM_SHARDS=100; FIRST_SHARD_ITEM=1     # item 0 = wit_1024, item i = shard i-1
@@ -77,10 +97,18 @@ case $DATASET in
     SIZES=(10000 50000 100000 500000 1000000 5000000 10000000 15000000)
     ALIGN_DIR=results/alignment/nested_laion15m; ALIGN_NAME=nested_laion15m
     KNN_DIR=results/knn/laion_15m; SWEEP_DIR=results/alignment/layer_sweep_laion15m; PERMS=${PERMS:-0} ;;
+  audio|video)
+    [ "$CAPTION" = original ] || { echo "$Q_CONFIG has original captions only"; exit 1; }
+    GAL=$Q_CONFIG; NUM_SHARDS=11; FIRST_SHARD_ITEM=1      # item 0 = queries, item i = gallery shard i-1
+    [ $DATASET = audio ] && IDX_DIR=$PLATO_DATA_ROOT/jordangong--laion-audio-100k/nested_indices \
+                         || IDX_DIR=$PLATO_DATA_ROOT/jordangong--pvd-100k/nested_indices
+    SIZES=(5000 10000 50000 100000)
+    KNN_EXTRA=(--size_includes_queries --clamp pool)
+    KNN_DIR=results/knn/$GAL; SWEEP_DIR=results/alignment/layer_sweep_$GAL; PERMS=${PERMS:-200} ;;
   *) echo "unknown DATASET $DATASET"; exit 1 ;;
 esac
 NUM_ITEMS=$((NUM_SHARDS + FIRST_SHARD_ITEM))
-G_VIS=$FEAT/$GAL/shards/${VIS_MODEL}
+G_VIS=$FEAT/$GAL/shards/${VIS_MODEL//\//_}
 G_LANG=$FEAT/$GAL/shards/${LANG_MODEL//\//_}${CAP_TAG}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-$(nproc)}
@@ -93,6 +121,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || tr
 extract() {  # extract <modality> <item>
   local mod=$1 item=$2 extra=()
   if [ "$mod" = vision ]; then
+    mod=$NT_MOD
     extra=(--model "$VIS_MODEL" --batch_size "$VIS_BS" --num_workers "${SLURM_CPUS_PER_TASK:-8}")
   else
     extra=(--model "$LANG_MODEL" --batch_size "$LANG_BS" --caption "$CAPTION"
@@ -100,7 +129,7 @@ extract() {  # extract <modality> <item>
   fi
   [ -n "$LAYERS" ] && extra+=(--layer_indices $LAYERS)
   if [ "$item" -lt "$FIRST_SHARD_ITEM" ]; then
-    $UV run python extract_features.py --modality "$mod" --config wit_1024 \
+    $UV run python extract_features.py --modality "$mod" --config $Q_CONFIG \
       --output_dir "$Q_OUT" "${extra[@]}"
   else
     $UV run python extract_features.py --modality "$mod" --config $GAL \
@@ -114,6 +143,8 @@ case $STAGE in
     for ((item = TASK * PER_TASK; item < (TASK + 1) * PER_TASK && item < NUM_ITEMS; item++)); do
       extract "$STAGE" "$item"
     done ;;
+  layers|align)
+    case $DATASET in audio|video) echo "STAGE=$STAGE is WIT/LAION only; use knn + sweep"; exit 1 ;; esac ;;&
   layers)
     $UV run python find_best_layers.py --vision_path "$Q_VIS" --language_path "$Q_LANG" --output "$BEST" ;;
   align)
@@ -129,7 +160,8 @@ case $STAGE in
     if [ "${MOD:?set MOD=vision|language}" = vision ]; then QP=$Q_VIS; SD=$G_VIS; NAME=$VIS_NAME; else QP=$Q_LANG; SD=$G_LANG; NAME=$LANG_NAME; fi
     NAME=${KNN_NAME:-$NAME}
     $UV run python knn_sets.py --query_path "$QP" --shard_dir "$SD" \
-      --gallery_indices_dir "$IDX_DIR" --sizes "${SIZES[@]}" --output $KNN_DIR/$NAME.pt ;;
+      --gallery_indices_dir "$IDX_DIR" --sizes "${SIZES[@]}" ${KNN_EXTRA[@]+"${KNN_EXTRA[@]}"} \
+      --output $KNN_DIR/$NAME.pt ;;
   sweep)
     A=${A:-$VIS_NAME}; B=${B:-$LANG_NAME}
     $UV run python layer_sweep.py --a $KNN_DIR/$A.pt --b $KNN_DIR/$B.pt \

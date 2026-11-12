@@ -74,6 +74,7 @@ def main():
     A = torch.load(args.a, map_location="cpu")
     B = torch.load(args.b, map_location="cpu")
     assert A["query_id0"] == B["query_id0"]
+    assert A.get("size_includes_queries", False) == B.get("size_includes_queries", False)
     qid0 = A["query_id0"]
     sizes = args.sizes or [n for n in A["sizes"] if n in B["sizes"]]
     nq = A["knn"][A["sizes"][0]].shape[1]
@@ -94,7 +95,8 @@ def main():
         # permutation tables: inv[p] maps B's neighbour ids to the sample now holding them
         g = torch.Generator().manual_seed(args.seed + n)
         members = torch.from_numpy(gallery_members(n, nq, args.gallery_indices_dir))
-        assert len(members) in (0, n)
+        n_gal = n - nq if A.get("size_includes_queries") else n  # knn_sets --size_includes_queries
+        assert len(members) in (0, n_gal), (n, len(members), n_gal)
         invs, piqs = [], []
         for _ in range(args.perms):
             inv = torch.arange(N, dtype=torch.int32)

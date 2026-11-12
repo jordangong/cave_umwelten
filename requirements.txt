@@ -12,3 +12,9 @@ matplotlib
 tqdm
 pillow-jxl-plugin
 imagehash
+# text-audio / text-video (build_av100k.py, extract_features --modality audio|video)
+torchaudio  # same version + CUDA variant as torch (2.5.1+cu121 here); Dasheng's feature extractor
+av
+soundfile
+soxr
+easydict    # VideoMAEv2 remote code
