@@ -10,3 +10,5 @@ protobuf
 numpy
 matplotlib
 tqdm
+pillow-jxl-plugin
+imagehash
